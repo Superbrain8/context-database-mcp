@@ -289,6 +289,17 @@ returned the containing chunk as the snippet.
 ## CI
 
 `.github/workflows/build.yml` runs clippy (`-D warnings`), `cargo test`, and a release build for
-Windows and Linux on every push and PR, uploading both binaries as artifacts. Pushing a `v*` tag also
-publishes them to a GitHub release. CI reaches neither Postgres nor the embedder, so it covers the
-chunker and transcript parsing only — everything else is verified by hand against the local stack.
+Windows and Linux on every push and PR. CI reaches neither Postgres nor the embedder, so it covers
+the chunker and transcript parsing only — everything else is verified by hand against the local
+stack.
+
+Ordinary builds only upload the binaries as run artifacts, which expire. Binaries reach the
+**Releases** page only on a tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Assets are named `context-database-mcp-<target-triple>` (`.exe` on Windows), and the publish step is
+a separate job that waits for every target, so a tag publishes all binaries or none.

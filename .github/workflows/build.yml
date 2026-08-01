@@ -14,9 +14,6 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # Needed by the tagged-release step; the default token is read-only.
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -24,15 +21,14 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: context-database-mcp.exe
+            asset: context-database-mcp-x86_64-pc-windows-msvc.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: context-database-mcp
+            asset: context-database-mcp-x86_64-unknown-linux-gnu
 
     steps:
-      # v5 on both actions below. That clears the Node 20 deprecation
-      # annotation for checkout; upload-artifact@v5 still ships a Node 20
-      # manifest, so its annotation stays until upstream bumps it.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
@@ -55,17 +51,46 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v5
+      # Named with the target triple before it leaves the runner. The release
+      # job flattens every leg of the matrix into one directory, where a bare
+      # `context-database-mcp` from two unix targets would collide -- today
+      # only the `.exe` extension keeps them apart, which is luck, not design.
+      #
+      # bash on windows-latest is Git Bash, so one script covers both legs.
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: context-database-mcp-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
-      # Tagged pushes additionally publish the binaries, so a machine that has
-      # no Rust toolchain can still run the server and the hooks.
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  # Publishing is its own job rather than a step inside the matrix: as a step,
+  # both legs race to create the same release, and whichever loses has to
+  # append to a release it did not make. Here the binaries are collected once,
+  # after every target has built, so a tag either publishes everything or
+  # nothing.
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Only this job writes anything; the build job keeps the default read-only
+    # token.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
         with:
-          files: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
           fail_on_unmatched_files: true
