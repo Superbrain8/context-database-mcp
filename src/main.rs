@@ -387,7 +387,18 @@ async fn print_recent(database_url: &str, scope: &Scope, limit: i64) -> anyhow::
         }
     };
 
-    if hits.is_empty() {
+    // Session summaries are kept out of the ranked list and offered as a single
+    // separate line -- see db::recent for why. A failure here must not cost the
+    // list that did load.
+    let summary = match db::latest_session_summary(&pool, scope).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("recent: session summary lookup failed: {e:#}");
+            None
+        }
+    };
+
+    if hits.is_empty() && summary.is_none() {
         return Ok(());
     }
 
@@ -395,19 +406,39 @@ async fn print_recent(database_url: &str, scope: &Scope, limit: i64) -> anyhow::
     // aware these memories exist so it can pull the ones it wants with
     // context_get; dumping bodies here would spend the context this is meant to
     // save, on every single session start.
-    println!(
-        "Long-term memory for this project holds {} recent item(s). \
-         Use context_get with an id to read one, or context_search to look for others.",
-        hits.len()
-    );
-    for h in hits {
+    if !hits.is_empty() {
         println!(
-            "  [id={}] ({}) {} | tags={:?} | {}",
-            h.id,
-            h.kind,
-            h.title,
-            h.tags,
-            h.created_at.format("%Y-%m-%d")
+            "Long-term memory for this project holds {} recent item(s). \
+             Use context_get with an id to read one, or context_search to look for others.",
+            hits.len()
+        );
+        for h in hits {
+            println!(
+                "  [id={}] ({}) {} | tags={:?} | {}",
+                h.id,
+                h.kind,
+                h.title,
+                h.tags,
+                h.created_at.format("%Y-%m-%d")
+            );
+        }
+    }
+
+    // Phrased as a condition rather than an instruction: after /clear this is
+    // the only trace of the session that was discarded, but on a session that
+    // starts fresh work it is last month's news and reading it would waste the
+    // context this whole mechanism exists to protect.
+    if let Some(s) = summary {
+        println!(
+            "The previous session in this project was compacted on {}; its summary is [id={}]. \
+             Read it with context_get only if this session continues that work.",
+            // Local, matching the timestamp --ingest puts in the title. The
+            // column is timestamptz, so formatting it directly prints UTC and
+            // the same summary would show two different times.
+            s.created_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M"),
+            s.id
         );
     }
     Ok(())

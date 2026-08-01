@@ -149,9 +149,11 @@ async fn store(
         scope,
         &title,
         summary,
-        "session-summary",
+        // The constant, not a literal: `--recent` filters on this exact kind,
+        // and the two drifting apart would silently undo that filter.
+        db::SESSION_SUMMARY,
         &[
-            "session-summary".to_string(),
+            db::SESSION_SUMMARY.to_string(),
             "auto-ingest".to_string(),
             trigger.to_string(),
         ],

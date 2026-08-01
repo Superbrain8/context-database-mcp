@@ -181,7 +181,15 @@ else gets.
 
 Search alone means recall only happens when the model thinks to ask for it. A `SessionStart` hook
 closes that gap by running the binary's `--recent` mode, which lists pinned and recent memories —
-titles and ids only, never bodies — so the model knows they exist:
+titles and ids only, never bodies — so the model knows they exist.
+
+Session summaries written by `--ingest` are held out of that list and offered on a separate line
+instead. The list sends titles only, so the title is the whole value of a slot: `sqlx must track
+whatever version pgvector resolves to` sells itself, while `session summary 2026-08-01 18:41` says
+nothing about whether it is worth fetching — and summaries are exactly the rows that would take over,
+one per compaction, always newest. Only the single newest one is mentioned, phrased as a condition
+("read it only if this session continues that work"), because after `/clear` it is the last trace of
+the discarded session and on fresh work it is noise. Both remain fully searchable.
 
 ```bash
 ./target/release/context-database-mcp --recent 5
