@@ -187,9 +187,10 @@ titles and ids only, never bodies — so the model knows they exist:
 ./target/release/context-database-mcp --recent 5
 ```
 
-Register it once in `~/.claude/settings.json` so it covers every project, alongside the user-scope
-MCP entry above. Leave `CTXDB_NAMESPACE` unset here too; hooks run with the project as their working
-directory, so the namespace resolves exactly as it does for the server:
+Hooks have the same two scopes as the MCP registration above, and for the same reason the user scope
+is the right default: `~/.claude/settings.json` covers every project at once, and the namespace still
+resolves per project because hooks run with the project as their working directory. Leave
+`CTXDB_NAMESPACE` unset here too:
 
 ```json
 {
@@ -210,6 +211,14 @@ memory store. It swallows every failure and exits 0, skips silently when the bin
 touches no embedder — so a stopped database, a still-loading model, or an unrelated repo all produce
 nothing rather than an error. On Windows the binary is `context-database-mcp.exe`.
 
+The same block works per project in `<project>/.claude/settings.json` (committed, shared with anyone
+who clones) or `<project>/.claude/settings.local.json` (git-ignored, yours only). Both merge with the
+user-scope config rather than replacing it, so a hook defined in both places runs twice — pick one.
+Project scope is worth it only when a single repo needs different behaviour, e.g. a larger
+`--recent` count. Prefer the local variant for anything holding an absolute path: a committed hook
+pointing at a binary that does not exist on someone else's disk fires on every session start of
+theirs.
+
 ### 5. Optional: ingest compaction summaries
 
 A memory store only saves tokens if it *replaces* context instead of adding to it. `/compact` leaves
@@ -218,7 +227,8 @@ if what the session learned is already stored. `--ingest` closes that: it reads 
 hook payload on stdin and saves the compaction summary as a `session-summary` memory.
 
 PostCompact, not PreCompact — at PreCompact no summary exists yet, and compaction events only accept
-`command` hooks, so the hook cannot summarise anything itself:
+`command` hooks, so the hook cannot summarise anything itself. Same scopes as above; user scope
+(`~/.claude/settings.json`) is the sane default:
 
 ```json
 {
