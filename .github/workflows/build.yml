@@ -29,8 +29,9 @@ jobs:
             bin: context-database-mcp
 
     steps:
-      # v5 on both actions below: v4 targets Node 20, which runners now force
-      # onto Node 24 with a deprecation annotation on every run.
+      # v5 on both actions below. That clears the Node 20 deprecation
+      # annotation for checkout; upload-artifact@v5 still ships a Node 20
+      # manifest, so its annotation stays until upstream bumps it.
       - uses: actions/checkout@v5
 
       - name: Install Rust
