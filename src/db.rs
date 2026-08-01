@@ -279,6 +279,29 @@ pub async fn get(pool: &PgPool, scope: &Scope, id: i64) -> Result<Option<MemoryR
     }))
 }
 
+/// Exact-body lookup, used by `--ingest` to stay idempotent.
+///
+/// Scoped like a write (client + namespace), not like a read: it exists to stop
+/// this process from inserting a duplicate of its own, and a matching body in
+/// another project is not that.
+pub async fn find_by_body(pool: &PgPool, scope: &Scope, body: &str) -> Result<Option<i64>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id FROM memory
+        WHERE client_id = $1 AND namespace = $2 AND body = $3 AND forgotten_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .bind(body)
+    .fetch_optional(pool)
+    .await
+    .context("looking for an identical body")?;
+
+    Ok(row.map(|r| r.get("id")))
+}
+
 /// Soft delete. The row stays on disk so a wrong forget can be undone by hand;
 /// nothing in the read path can see it again.
 pub async fn forget(pool: &PgPool, scope: &Scope, id: i64, reason: Option<&str>) -> Result<bool> {

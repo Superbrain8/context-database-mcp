@@ -6,6 +6,7 @@
 
 mod db;
 mod embed;
+mod ingest;
 
 use std::sync::Arc;
 
@@ -338,6 +339,12 @@ fn env_or(key: &str, default: &str) -> String {
 /// The trade-off is that the namespace is the *folder name*, not the full path,
 /// so two checkouts named `api` in different parents share one namespace. Set
 /// `CTXDB_NAMESPACE` explicitly to separate them.
+fn namespace_from_dir(dir: &std::path::Path) -> Option<String> {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().trim().to_string())
+        .filter(|n| !n.is_empty())
+}
+
 fn resolve_namespace() -> String {
     if let Ok(ns) = std::env::var("CTXDB_NAMESPACE") {
         let ns = ns.trim();
@@ -348,11 +355,7 @@ fn resolve_namespace() -> String {
 
     let derived = std::env::current_dir()
         .ok()
-        .and_then(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().trim().to_string())
-                .filter(|n| !n.is_empty())
-        })
+        .and_then(|p| namespace_from_dir(&p))
         .unwrap_or_else(|| "default".to_string());
 
     // Logged loudly: a silently wrong namespace is the worst failure this thing
@@ -449,6 +452,14 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(5)
             .clamp(1, 50);
         return print_recent(&database_url, &scope, limit).await;
+    }
+
+    // `--ingest`: read a PostCompact hook payload on stdin and store the
+    // compaction summary. Stdout stays empty on this path -- a compaction hook
+    // that prints goes straight into the freshly compacted context, which is
+    // exactly the cost this mode exists to avoid.
+    if args.iter().any(|a| a == "--ingest") {
+        return ingest::run(&database_url, embed_url, embed_model, scope).await;
     }
 
     tracing::info!(
