@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "CTXDB_CLIENT_ID=claude-code CTXDB_NAMESPACE=context-database-mcp ./target/release/context-database-mcp.exe --recent 5 2>/dev/null || true",
+            "command": "BIN=./target/release/context-database-mcp; [ -x \"$BIN.exe\" ] && BIN=\"$BIN.exe\"; [ -x \"$BIN\" ] || exit 0; CTXDB_CLIENT_ID=claude-code CTXDB_NAMESPACE=context-database-mcp \"$BIN\" --recent 5 2>/dev/null || true",
             "timeout": 15,
             "statusMessage": "Loading long-term memory..."
           }

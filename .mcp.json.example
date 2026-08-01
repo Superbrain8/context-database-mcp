@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "context-db": {
-      "command": "D:/Projects/Context_Database_MCP/target/release/context-database-mcp.exe",
+      "command": "/ABSOLUTE/PATH/TO/context-database-mcp/target/release/context-database-mcp",
       "env": {
         "CTXDB_CLIENT_ID": "claude-code",
         "CTXDB_NAMESPACE": "context-database-mcp"

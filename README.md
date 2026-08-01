@@ -135,29 +135,20 @@ cargo build --release
 
 Give each client its own `CTXDB_CLIENT_ID`.
 
-**Claude Code** (`.mcp.json` in the project root):
+**Claude Code** — copy the example and put your own absolute path in it:
 
-```json
-{
-  "mcpServers": {
-    "context-db": {
-      "command": "d:/Projects/Context_Database_MCP/target/release/context-database-mcp.exe",
-      "env": {
-        "CTXDB_CLIENT_ID": "claude-code",
-        "CTXDB_NAMESPACE": "context-database-mcp"
-      }
-    }
-  }
-}
+```bash
+cp .mcp.json.example .mcp.json     # then edit the "command" path
 ```
+
+`.mcp.json` is gitignored on purpose. The server is launched by absolute path, and a committed entry
+pointing at a binary that does not exist on someone else's disk throws an error in their client
+every single session. On Windows the binary is `context-database-mcp.exe`.
 
 **Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`): same block with
 `"CTXDB_CLIENT_ID": "claude-desktop"`.
 
 Unset variables fall back to the defaults in `.env.example`.
-
-The committed `.mcp.json` uses an absolute path to the binary, so it is machine-specific — adjust it
-if the repo lives elsewhere.
 
 ### 4. Optional: push memories at session start
 
@@ -166,11 +157,13 @@ registers a `SessionStart` hook that runs the binary's `--recent` mode and lists
 memories (titles and ids only, never bodies) so the model knows they exist:
 
 ```bash
-./target/release/context-database-mcp.exe --recent 5
+./target/release/context-database-mcp --recent 5
 ```
 
 The hook swallows every failure and exits 0 — a memory store being down must never break a session.
-It touches no embedder, so it also works while the model weights are still loading.
+It touches no embedder, so it also works while the model weights are still loading, and it exits
+quietly when the binary has not been built yet. Unlike `.mcp.json` it uses a path relative to the
+project root and picks up the `.exe` suffix on Windows automatically, so it is safe to commit.
 
 ## Operational notes
 

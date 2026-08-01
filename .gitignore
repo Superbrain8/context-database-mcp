@@ -1,3 +1,8 @@
 /target
 .env
 *.pdb
+
+# Machine-specific: the MCP server is launched by absolute path, and a committed
+# entry pointing at a binary that does not exist on the cloner's disk throws an
+# error in their client every session. Copy .mcp.json.example instead.
+.mcp.json
