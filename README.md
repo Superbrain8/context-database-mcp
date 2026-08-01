@@ -303,3 +303,9 @@ git push origin v0.1.0
 
 Assets are named `context-database-mcp-<target-triple>` (`.exe` on Windows), and the publish step is
 a separate job that waits for every target, so a tag publishes all binaries or none.
+
+## License
+
+[GNU AGPL-3.0-only](LICENSE). Use it, change it, run it — but a modified version offered to others
+over a network has to come with its source, which is the point of the network clause. This is a
+memory store people will run as a service for themselves; AGPL keeps any hosted fork of it open.

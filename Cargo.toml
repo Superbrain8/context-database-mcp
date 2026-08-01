@@ -2,6 +2,9 @@
 name = "context-database-mcp"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Superbrain8/context-database-mcp"
+description = "MCP server giving an LLM long-term memory in Postgres + pgvector, fully offline"
 
 [dependencies]
 rmcp = { version = "3", features = ["server", "transport-io"] }
