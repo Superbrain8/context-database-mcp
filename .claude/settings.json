@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CTXDB_CLIENT_ID=claude-code CTXDB_NAMESPACE=context-database-mcp ./target/release/context-database-mcp.exe --recent 5 2>/dev/null || true",
+            "timeout": 15,
+            "statusMessage": "Loading long-term memory..."
+          }
+        ]
+      }
+    ]
+  }
+}

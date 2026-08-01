@@ -1,0 +1,40 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: ctxdb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ctx
+      POSTGRES_PASSWORD: ctx
+      POSTGRES_DB: ctxdb
+    ports:
+      # 5433 on host so it never clashes with a local postgres on 5432
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # runs only on first init of an empty volume
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ctx -d ctxdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  embed:
+    # Shared embedding server. One model in memory, all MCP client processes use it.
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: ctxdb-embed
+    restart: unless-stopped
+    command:
+      - --model-id=BAAI/bge-m3
+      - --pooling=cls
+      - --max-client-batch-size=64
+    ports:
+      - "127.0.0.1:8085:80"
+    volumes:
+      # model weights cached here, downloaded once on first start (~2.2 GB)
+      - hfcache:/data
+
+volumes:
+  pgdata:
+  hfcache:

@@ -1,0 +1,40 @@
+[package]
+name = "context-database-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmcp = { version = "3", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# must match what rmcp 3.1 depends on (^1.1) -- two schemars versions in the
+# tree means the derived JsonSchema impl does not satisfy rmcp's trait bound
+schemars = "1"
+# No TLS anywhere: postgres and the embedder are both on 127.0.0.1. This keeps
+# ring/aws-lc-rs out of the tree, so the build needs no C toolchain.
+#
+# This MUST stay on the same minor as whatever pgvector resolves to. pgvector
+# 0.4.2 allows `sqlx >=0.8, <0.10`, so cargo hands it 0.9; pinning 0.8 here put
+# two incompatible sqlx_core crates in the graph and `Vector` then implemented
+# the *other* copy's Encode/Type traits.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-none",
+    "postgres",
+    "chrono",
+    "json",
+    "macros",
+] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
