@@ -323,14 +323,26 @@ pub async fn forget(pool: &PgPool, scope: &Scope, id: i64, reason: Option<&str>)
     Ok(done.rows_affected() > 0)
 }
 
+/// The kind `--ingest` writes. Held apart from the rest of the push list; see
+/// `recent`.
+pub const SESSION_SUMMARY: &str = "session-summary";
+
 /// Pinned + most recent, for the SessionStart push path (`--recent`).
+///
+/// Session summaries are excluded deliberately. The push sends titles only, so
+/// the model can judge relevance without paying for bodies -- which makes the
+/// title the entire value of a slot. "session summary 2026-08-01 18:41" says
+/// nothing about whether it is worth fetching, while "sqlx must track whatever
+/// version pgvector resolves to" sells itself. And summaries are exactly the
+/// rows that would monopolise the list: one per compaction, always newest.
+/// `latest_session_summary` surfaces one of them separately instead.
 pub async fn recent(pool: &PgPool, scope: &Scope, limit: i64) -> Result<Vec<SearchHit>> {
     let rows = sqlx::query(
         r#"
         SELECT id, title, left(body, 300) AS snippet, kind, tags, namespace,
                created_at, 0.0::float8 AS score
         FROM memory_live
-        WHERE client_id = $1 AND namespace = $2
+        WHERE client_id = $1 AND namespace = $2 AND kind <> $4
         ORDER BY pinned DESC, created_at DESC
         LIMIT $3
         "#,
@@ -338,6 +350,7 @@ pub async fn recent(pool: &PgPool, scope: &Scope, limit: i64) -> Result<Vec<Sear
     .bind(&scope.client_id)
     .bind(&scope.namespace)
     .bind(limit)
+    .bind(SESSION_SUMMARY)
     .fetch_all(pool)
     .await
     .context("listing recent memories")?;
@@ -355,4 +368,40 @@ pub async fn recent(pool: &PgPool, scope: &Scope, limit: i64) -> Result<Vec<Sear
             score: r.get("score"),
         })
         .collect())
+}
+
+/// The newest compaction summary, or None if this project has never compacted.
+///
+/// Exactly one, and never more: straight after `/clear` the last summary is the
+/// only thing standing in for the session that was thrown away, but the one
+/// before it is just an older session -- no more deserving of a slot than any
+/// other memory, and reachable through search like everything else.
+pub async fn latest_session_summary(pool: &PgPool, scope: &Scope) -> Result<Option<SearchHit>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, title, left(body, 300) AS snippet, kind, tags, namespace,
+               created_at, 0.0::float8 AS score
+        FROM memory_live
+        WHERE client_id = $1 AND namespace = $2 AND kind = $3
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .bind(SESSION_SUMMARY)
+    .fetch_optional(pool)
+    .await
+    .context("fetching the latest session summary")?;
+
+    Ok(row.map(|r| SearchHit {
+        id: r.get("id"),
+        title: r.get("title"),
+        snippet: r.get("snippet"),
+        kind: r.get("kind"),
+        tags: r.get("tags"),
+        namespace: r.get("namespace"),
+        created_at: r.get("created_at"),
+        score: r.get("score"),
+    }))
 }
