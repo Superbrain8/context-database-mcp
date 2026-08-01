@@ -6,3 +6,9 @@
 # entry pointing at a binary that does not exist on the cloner's disk throws an
 # error in their client every session. Copy .mcp.json.example instead.
 .mcp.json
+
+# Same reasoning: this project's Claude Code config is user-scope only, so the
+# server and its hooks are registered once in ~/.claude and never here. Accepting
+# a permission prompt writes .claude/settings.json back anyway, and a committed
+# copy would apply one machine's answers to everyone who clones.
+/.claude/
