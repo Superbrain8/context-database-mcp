@@ -135,7 +135,35 @@ cargo build --release
 
 Give each client its own `CTXDB_CLIENT_ID`.
 
-**Claude Code** — copy the example and put your own absolute path in it:
+#### Once for every project (user scope)
+
+`CTXDB_NAMESPACE` defaults to the name of the server's working directory, and clients launch the
+server with the project as its working directory. So one user-scope registration covers every
+project and each still gets its own namespace — register it once in `~/.claude.json` and leave
+`CTXDB_NAMESPACE` unset:
+
+```json
+{
+  "mcpServers": {
+    "context-db": {
+      "command": "/ABSOLUTE/PATH/TO/context-database-mcp/target/release/context-database-mcp",
+      "env": { "CTXDB_CLIENT_ID": "claude-code" }
+    }
+  }
+}
+```
+
+Do **not** pin `CTXDB_NAMESPACE` here: a user-scope value applies to every project at once, so all of
+them would share a single namespace and the isolation would be gone. The server logs the namespace
+it resolved on startup, because a silently wrong one is the worst failure mode this has — saves
+still succeed, they just become invisible.
+
+The derived namespace is the folder name, not the full path, so two checkouts named `api` under
+different parents share one namespace. Override per project when that matters.
+
+#### Per project (overrides user scope)
+
+Use this when the folder name is not the namespace you want.
 
 ```bash
 cp .mcp.json.example .mcp.json     # then edit the "command" path
@@ -149,6 +177,10 @@ every single session. On Windows the binary is `context-database-mcp.exe`.
 `"CTXDB_CLIENT_ID": "claude-desktop"`.
 
 Unset variables fall back to the defaults in `.env.example`.
+
+This repository is itself such a case: its folder is `Context_Database_MCP`, but its memories live
+under `context-database-mcp`, so the committed `.claude/settings.json` and the local `.mcp.json` both
+pin the namespace explicitly.
 
 ### 4. Optional: push memories at session start
 

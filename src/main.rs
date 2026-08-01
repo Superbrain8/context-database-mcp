@@ -328,6 +328,42 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Which project's memories this process may touch.
+///
+/// `CTXDB_NAMESPACE` wins when set. Otherwise the working directory's name is
+/// used, which is what makes a single user-scope MCP registration usable across
+/// every project: clients launch the server with the project as its working
+/// directory, so the namespace follows the project without per-project config.
+///
+/// The trade-off is that the namespace is the *folder name*, not the full path,
+/// so two checkouts named `api` in different parents share one namespace. Set
+/// `CTXDB_NAMESPACE` explicitly to separate them.
+fn resolve_namespace() -> String {
+    if let Ok(ns) = std::env::var("CTXDB_NAMESPACE") {
+        let ns = ns.trim();
+        if !ns.is_empty() {
+            return ns.to_string();
+        }
+    }
+
+    let derived = std::env::current_dir()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().trim().to_string())
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    // Logged loudly: a silently wrong namespace is the worst failure this thing
+    // has, because saves still succeed and simply become invisible.
+    tracing::info!(
+        namespace = %derived,
+        "CTXDB_NAMESPACE not set, derived namespace from working directory"
+    );
+    derived
+}
+
 /// Body of `--recent`. A session-start hook must never break the session, so
 /// every failure here is swallowed: the process prints nothing and exits 0
 /// rather than surfacing a database error into the transcript.
@@ -388,7 +424,7 @@ async fn main() -> anyhow::Result<()> {
 
     let scope = Scope {
         client_id: env_or("CTXDB_CLIENT_ID", "unknown-client"),
-        namespace: env_or("CTXDB_NAMESPACE", "default"),
+        namespace: resolve_namespace(),
         session_id: uuid::Uuid::new_v4().to_string(),
     };
 
