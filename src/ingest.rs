@@ -77,7 +77,7 @@ pub async fn run(
         tracing::warn!("ingest: no compaction summary found in payload or transcript");
         return Ok(());
     };
-    let summary = strip_continuation_preamble(&summary);
+    let summary = strip_preamble(&summary);
 
     if summary.chars().count() < MIN_SUMMARY_CHARS {
         tracing::warn!("ingest: summary too short to be real, skipping");
@@ -237,6 +237,36 @@ fn message_text(entry: &Value) -> Option<String> {
     }
 }
 
+/// Reduce a raw transcript entry to the summary itself.
+///
+/// The same summary reaches us in two shapes and both carry framing worth
+/// dropping, so both strippers run.
+fn strip_preamble(text: &str) -> &str {
+    strip_continuation_preamble(strip_analysis_block(text.trim()))
+}
+
+/// Drop the `<analysis>` block that precedes the summary proper.
+///
+/// A compaction emits its reasoning first -- a chronological re-walk of the
+/// session -- and only then the `<summary>` that distils it. On a real
+/// compaction the analysis measured 7 KB of a 20 KB entry: a third of the row's
+/// chunks spent restating what the summary below already says, diluting every
+/// embedding in it.
+///
+/// Only the *continued-session* shape was ever seen in testing, which is why
+/// this went unnoticed until a real `/compact` ran: that shape arrives already
+/// stripped, wrapped in prose instead.
+fn strip_analysis_block(t: &str) -> &str {
+    const CLOSE: &str = "</analysis>";
+    let rest = match t.find(CLOSE) {
+        Some(i) => t[i + CLOSE.len()..].trim_start(),
+        None => t,
+    };
+    // The tags themselves are noise once the block around them is gone.
+    let rest = rest.strip_prefix("<summary>").unwrap_or(rest).trim_start();
+    rest.strip_suffix("</summary>").unwrap_or(rest).trim_end()
+}
+
 /// Drop the "This session is being continued..." framing that Claude Code wraps
 /// around every summary.
 ///
@@ -317,5 +347,35 @@ mod tests {
     fn text_without_the_preamble_is_untouched() {
         let text = "1. Primary Request: build the thing";
         assert_eq!(strip_continuation_preamble(text), text);
+    }
+
+    #[test]
+    fn analysis_block_is_dropped() {
+        // The shape a real /compact writes, as opposed to the one a continued
+        // session carries.
+        let text = "<analysis>\nLet me work through the conversation.\n</analysis>\n\n\
+                    <summary>\n1. Primary Request: build the thing\n</summary>";
+        let out = strip_preamble(text);
+        assert_eq!(out, "1. Primary Request: build the thing");
+    }
+
+    #[test]
+    fn summary_tags_are_dropped_without_an_analysis_block() {
+        assert_eq!(strip_preamble("<summary>\nbody\n</summary>"), "body");
+    }
+
+    #[test]
+    fn unclosed_analysis_block_keeps_the_text() {
+        // Truncated entry: cutting on the opening tag alone would throw the
+        // whole row away, so nothing is cut without a close tag to cut at.
+        let text = "<analysis>\nreasoning that never closes";
+        assert_eq!(strip_preamble(text), text);
+    }
+
+    #[test]
+    fn both_strippers_run_in_sequence() {
+        let text = "This session is being continued from a previous conversation.\n\n\
+                    Summary:\n1. did the thing";
+        assert!(strip_preamble(text).starts_with("Summary:"));
     }
 }
