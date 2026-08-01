@@ -166,6 +166,22 @@ pub fn chunk_text(text: &str) -> Vec<String> {
         }
         // Step forward with overlap, but always make progress.
         start = end.saturating_sub(CHUNK_OVERLAP).max(start + 1);
+
+        // The overlap step lands on an arbitrary character, so a chunk would
+        // otherwise open mid-word ("cceptable because..."). That is read
+        // directly by the model -- a hit's snippet is its whole chunk -- so
+        // nudge forward to the next word boundary.
+        if start > 0 && start < chars.len() && !chars[start - 1].is_whitespace() {
+            let mut w = start;
+            while w < chars.len() && !chars[w].is_whitespace() {
+                w += 1;
+            }
+            // Only take it if a boundary exists before the next chunk's end;
+            // unbroken text must not stall progress.
+            if w < chars.len() {
+                start = w + 1;
+            }
+        }
     }
 
     chunks
@@ -230,6 +246,23 @@ mod tests {
         let chunks = chunk_text(&body);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| c.contains('ü') || c.contains('ö') || c.contains('ß')));
+    }
+
+    #[test]
+    fn chunks_do_not_start_mid_word() {
+        // Chunk text is what the model reads as a search snippet, so a chunk
+        // opening on a word fragment is a real defect, not cosmetic.
+        let body = "The deployment pipeline is acceptable because mutations are rare. "
+            .repeat(60);
+        let chunks = chunk_text(&body);
+        assert!(chunks.len() > 2);
+        for (i, c) in chunks.iter().enumerate().skip(1) {
+            let first = c.split_whitespace().next().unwrap();
+            assert!(
+                body.contains(&format!(" {first} ")) || body.starts_with(first),
+                "chunk {i} starts mid-word: {first:?}"
+            );
+        }
     }
 
     #[test]
