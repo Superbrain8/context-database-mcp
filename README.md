@@ -161,41 +161,54 @@ still succeed, they just become invisible.
 The derived namespace is the folder name, not the full path, so two checkouts named `api` under
 different parents share one namespace. Override per project when that matters.
 
-#### Per project (overrides user scope)
-
-Use this when the folder name is not the namespace you want.
-
-```bash
-cp .mcp.json.example .mcp.json     # then edit the "command" path
-```
-
-`.mcp.json` is gitignored on purpose. The server is launched by absolute path, and a committed entry
-pointing at a binary that does not exist on someone else's disk throws an error in their client
-every single session. On Windows the binary is `context-database-mcp.exe`.
-
 **Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`): same block with
 `"CTXDB_CLIENT_ID": "claude-desktop"`.
 
 Unset variables fall back to the defaults in `.env.example`.
 
-This repository is itself such a case: its folder is `Context_Database_MCP`, but its memories live
-under `context-database-mcp`, so the committed `.claude/settings.json` and the local `.mcp.json` both
-pin the namespace explicitly.
+#### Per project, only when you need to override
+
+A project-level `.mcp.json` is worth adding only when the folder name is not the namespace you want
+— two checkouts sharing a name, or a folder you would rather not have as the identifier. Copy
+`.mcp.json.example`, set the absolute binary path, and pin `CTXDB_NAMESPACE`. Keep `.mcp.json` out of
+version control: the server is launched by absolute path, and a committed entry pointing at a binary
+that does not exist on someone else's disk errors in their client every session.
+
+This repository deliberately has no project-level config, so it exercises the same path everyone
+else gets.
 
 ### 4. Optional: push memories at session start
 
-Search alone means recall only happens when the model thinks to ask for it. `.claude/settings.json`
-registers a `SessionStart` hook that runs the binary's `--recent` mode and lists pinned and recent
-memories (titles and ids only, never bodies) so the model knows they exist:
+Search alone means recall only happens when the model thinks to ask for it. A `SessionStart` hook
+closes that gap by running the binary's `--recent` mode, which lists pinned and recent memories —
+titles and ids only, never bodies — so the model knows they exist:
 
 ```bash
 ./target/release/context-database-mcp --recent 5
 ```
 
-The hook swallows every failure and exits 0 — a memory store being down must never break a session.
-It touches no embedder, so it also works while the model weights are still loading, and it exits
-quietly when the binary has not been built yet. Unlike `.mcp.json` it uses a path relative to the
-project root and picks up the `.exe` suffix on Windows automatically, so it is safe to commit.
+Register it once in `~/.claude/settings.json` so it covers every project, alongside the user-scope
+MCP entry above. Leave `CTXDB_NAMESPACE` unset here too; hooks run with the project as their working
+directory, so the namespace resolves exactly as it does for the server:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "BIN=\"/ABSOLUTE/PATH/TO/context-database-mcp/target/release/context-database-mcp\"; [ -x \"$BIN\" ] || exit 0; CTXDB_CLIENT_ID=claude-code \"$BIN\" --recent 5 2>/dev/null || true",
+        "timeout": 15
+      }]
+    }]
+  }
+}
+```
+
+The guard matters: this hook runs in *every* project, including ones that have never used the
+memory store. It swallows every failure and exits 0, skips silently when the binary is missing, and
+touches no embedder — so a stopped database, a still-loading model, or an unrelated repo all produce
+nothing rather than an error. On Windows the binary is `context-database-mcp.exe`.
 
 ## Operational notes
 
