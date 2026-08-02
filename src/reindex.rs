@@ -60,11 +60,15 @@ pub async fn run(
         scope.client_id
     );
 
+    // Built before the dry-run branch: chunk boundaries now come from the
+    // server's tokenizer, so even a run that writes nothing has to reach it.
+    let embedder = embed::Embedder::new(embed_url, embed_model);
+
     if dry_run {
         let mut planned = 0usize;
         let mut stale = 0usize;
         for row in &rows {
-            let (chunks, _) = embed::chunk_inputs(&row.title, &row.body);
+            let (chunks, _) = embedder.chunk_inputs(&row.title, &row.body).await?;
             planned += chunks.len();
 
             // Compared as text, not by count: the chunker fix this mode exists
@@ -91,7 +95,6 @@ pub async fn run(
         return Ok(());
     }
 
-    let embedder = embed::Embedder::new(embed_url, embed_model);
     // Before a single chunk is deleted. A dead embedder discovered on row 30
     // leaves the corpus half-converted for no reason.
     embedder.ping().await?;
@@ -101,7 +104,7 @@ pub async fn run(
     let mut chunks_after = 0usize;
 
     for row in &rows {
-        let (chunks, inputs) = embed::chunk_inputs(&row.title, &row.body);
+        let (chunks, inputs) = embedder.chunk_inputs(&row.title, &row.body).await?;
         if chunks.is_empty() {
             // A body that chunks to nothing is whitespace. Deleting its chunks
             // would strip it from search; leaving them costs nothing.

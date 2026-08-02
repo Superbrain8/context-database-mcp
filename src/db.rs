@@ -38,7 +38,21 @@ pub struct MemoryRow {
     pub tags: Vec<String>,
     pub namespace: String,
     pub created_at: DateTime<Utc>,
-    pub supersedes_id: Option<i64>,
+    /// Every memory this one retired, read from the back-references rather than
+    /// from `supersedes_id`. A consolidation retires several rows at once and
+    /// that column holds one, so it is the back-reference that is complete.
+    pub supersedes: Vec<i64>,
+}
+
+/// What a save did, so the caller can report which ids it actually retired.
+///
+/// `retired` is not always the ids that were asked for: an id in another
+/// project, or one already superseded, is left alone. Silently accepting those
+/// is how a consolidation appears to work and leaves the originals in search.
+#[derive(Debug)]
+pub struct Saved {
+    pub id: i64,
+    pub retired: Vec<i64>,
 }
 
 pub async fn connect(url: &str) -> Result<PgPool> {
@@ -53,6 +67,10 @@ pub async fn connect(url: &str) -> Result<PgPool> {
 /// `chunks` pairs each chunk's text with its embedding, in order. The memory row
 /// itself carries no vector -- a memory is found through its best-matching
 /// chunk (see `search`).
+///
+/// `supersedes` may name several rows: a consolidation replaces a whole cluster
+/// of overlapping memories with one merged memory, and retiring them one call at
+/// a time would leave the corpus half-merged if any call failed.
 #[allow(clippy::too_many_arguments)]
 pub async fn save(
     pool: &PgPool,
@@ -63,8 +81,8 @@ pub async fn save(
     tags: &[String],
     chunks: Vec<(String, Vec<f32>)>,
     embed_model: &str,
-    supersedes: Option<i64>,
-) -> Result<i64> {
+    supersedes: &[i64],
+) -> Result<Saved> {
     let mut tx = pool.begin().await?;
 
     let id: i64 = sqlx::query(
@@ -84,7 +102,10 @@ pub async fn save(
     .bind(body)
     .bind(tags)
     .bind(embed_model)
-    .bind(supersedes)
+    // One column, so it records the first id only. It survives because a
+    // single-row correction is still the common case and existing rows carry
+    // it; the complete list lives in the back-references (see `get`).
+    .bind(supersedes.first())
     .fetch_one(&mut *tx)
     .await
     .context("inserting memory")?
@@ -106,26 +127,35 @@ pub async fn save(
         .context("inserting memory chunk")?;
     }
 
-    // Close the loop on the superseded row so it drops out of search. Scoped to
-    // the same client+namespace so one client cannot retire another's memory.
-    if let Some(old) = supersedes {
-        sqlx::query(
+    // Close the loop on the superseded rows so they drop out of search. Scoped
+    // to the same client+namespace so one client cannot retire another's memory.
+    //
+    // Rows already superseded are skipped rather than re-pointed: their existing
+    // link is a record of what actually replaced them, and overwriting it to
+    // claim this memory did would be a lie about history that nothing can undo.
+    let mut retired: Vec<i64> = Vec::new();
+    if !supersedes.is_empty() {
+        let rows = sqlx::query(
             r#"
             UPDATE memory SET superseded_by = $1
-            WHERE id = $2 AND client_id = $3 AND namespace = $4
+            WHERE id = ANY($2) AND client_id = $3 AND namespace = $4
+              AND superseded_by IS NULL AND id <> $1
+            RETURNING id
             "#,
         )
         .bind(id)
-        .bind(old)
+        .bind(supersedes)
         .bind(&scope.client_id)
         .bind(&scope.namespace)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
-        .context("marking superseded row")?;
+        .context("marking superseded rows")?;
+        retired = rows.into_iter().map(|r| r.get("id")).collect();
+        retired.sort_unstable();
     }
 
     tx.commit().await?;
-    Ok(id)
+    Ok(Saved { id, retired })
 }
 
 /// Hybrid retrieval: dense vector search fused with BM25-ish full-text search.
@@ -258,7 +288,7 @@ pub async fn get(pool: &PgPool, scope: &Scope, id: i64) -> Result<Option<MemoryR
         UPDATE memory
         SET accessed_at = now(), access_count = access_count + 1
         WHERE id = $1 AND client_id = $2 AND forgotten_at IS NULL
-        RETURNING id, title, body, kind, tags, namespace, created_at, supersedes_id
+        RETURNING id, title, body, kind, tags, namespace, created_at
         "#,
     )
     .bind(id)
@@ -267,7 +297,20 @@ pub async fn get(pool: &PgPool, scope: &Scope, id: i64) -> Result<Option<MemoryR
     .await
     .context("fetching memory")?;
 
-    Ok(row.map(|r| MemoryRow {
+    let Some(r) = row else {
+        return Ok(None);
+    };
+
+    // Back-references, not `supersedes_id`: a merged memory retires several rows
+    // and that column holds one of them. Worth the second query -- a memory that
+    // replaced four others reads very differently from one that replaced none.
+    let retired = sqlx::query("SELECT id FROM memory WHERE superseded_by = $1 ORDER BY id")
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .context("listing superseded rows")?;
+
+    Ok(Some(MemoryRow {
         id: r.get("id"),
         title: r.get("title"),
         body: r.get("body"),
@@ -275,7 +318,7 @@ pub async fn get(pool: &PgPool, scope: &Scope, id: i64) -> Result<Option<MemoryR
         tags: r.get("tags"),
         namespace: r.get("namespace"),
         created_at: r.get("created_at"),
-        supersedes_id: r.get("supersedes_id"),
+        supersedes: retired.into_iter().map(|r| r.get("id")).collect(),
     }))
 }
 
@@ -666,6 +709,109 @@ pub async fn restore(pool: &PgPool, scope: &Scope, id: i64, detach: bool) -> Res
     }))
 }
 
+/// Two live memories that are close enough to be worth reading side by side.
+#[derive(Debug)]
+pub struct NearPair {
+    pub a: i64,
+    pub b: i64,
+    /// Smallest cosine distance between any chunk of `a` and any chunk of `b`.
+    pub dist: f64,
+}
+
+/// Live memory pairs whose closest chunks sit within `threshold`, for
+/// `--consolidate`.
+///
+/// Compared chunk to chunk, taking the minimum. Whole-memory similarity is the
+/// wrong measure for redundancy: a long note that repeats one paragraph of
+/// another averages out to "unrelated", and that repeated paragraph is exactly
+/// the thing worth merging.
+///
+/// Namespace-scoped, like every other write-side decision. Consolidation ends in
+/// a save, and a save never reaches across projects.
+///
+/// The self-join is O(chunks squared) with no index help -- `<=>` between two
+/// table columns cannot use HNSW, which only accelerates a constant query
+/// vector. Fine at this corpus's scale (hundreds of chunks, tens of thousands of
+/// comparisons); it is the first thing that will need rethinking at tens of
+/// thousands of chunks.
+pub async fn near_pairs(pool: &PgPool, scope: &Scope, threshold: f64) -> Result<Vec<NearPair>> {
+    let rows = sqlx::query(
+        r#"
+        WITH live AS (
+            SELECT id FROM memory_live
+            WHERE client_id = $1 AND namespace = $2
+        )
+        SELECT a.memory_id AS a, b.memory_id AS b,
+               min(a.embedding <=> b.embedding) AS dist
+        FROM memory_chunk a
+        JOIN memory_chunk b ON b.memory_id > a.memory_id
+        JOIN live la ON la.id = a.memory_id
+        JOIN live lb ON lb.id = b.memory_id
+        WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL
+        GROUP BY a.memory_id, b.memory_id
+        HAVING min(a.embedding <=> b.embedding) <= $3
+        ORDER BY dist
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .bind(threshold)
+    .fetch_all(pool)
+    .await
+    .context("finding near-duplicate memories")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| NearPair {
+            a: r.get("a"),
+            b: r.get("b"),
+            dist: r.get("dist"),
+        })
+        .collect())
+}
+
+/// Enough of a memory to decide whether it belongs in a merge, without paying
+/// for its body.
+#[derive(Debug)]
+pub struct Brief {
+    pub id: i64,
+    pub title: String,
+    pub kind: String,
+    pub pinned: bool,
+    /// `length(body)`, which Postgres returns as int4.
+    pub body_chars: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn briefs(pool: &PgPool, scope: &Scope, ids: &[i64]) -> Result<Vec<Brief>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title, kind, pinned, length(body) AS body_chars, created_at
+        FROM memory_live
+        WHERE client_id = $1 AND namespace = $2 AND id = ANY($3)
+        ORDER BY created_at
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+    .context("reading memory briefs")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| Brief {
+            id: r.get("id"),
+            title: r.get("title"),
+            kind: r.get("kind"),
+            pinned: r.get("pinned"),
+            body_chars: r.get("body_chars"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
 /// The kind `--ingest` writes. Held apart from the rest of the push list; see
 /// `recent`.
 pub const SESSION_SUMMARY: &str = "session-summary";
@@ -747,4 +893,89 @@ pub async fn latest_session_summary(pool: &PgPool, scope: &Scope) -> Result<Opti
         created_at: r.get("created_at"),
         score: r.get("score"),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercises the supersede bookkeeping against a real database, in a scope
+    /// nothing else uses.
+    ///
+    /// `#[ignore]` because CI reaches no Postgres, so this is run by hand:
+    ///   cargo test -- --ignored --nocapture
+    /// It is worth keeping anyway -- the two bugs this file has produced (an
+    /// int4 column decoded as i64, an array bind) are both invisible to a test
+    /// suite with no database, and both would have been caught here.
+    #[tokio::test]
+    #[ignore]
+    async fn a_merge_retires_every_row_it_names_and_reports_the_rest() -> Result<()> {
+        let url = std::env::var("CTXDB_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://ctx:ctx@127.0.0.1:5433/ctxdb".to_string());
+        let pool = connect(&url).await?;
+
+        let scope = Scope {
+            client_id: "ctxdb-selftest".to_string(),
+            namespace: "__ctxdb_selftest".to_string(),
+            session_id: "test".to_string(),
+        };
+        let other = Scope {
+            namespace: "__ctxdb_selftest_other".to_string(),
+            ..scope.clone()
+        };
+        // Zeroed vectors: this test is about the supersede bookkeeping, and the
+        // embedder has no bearing on it.
+        let chunk = || vec![("chunk".to_string(), vec![0.0f32; 1024])];
+
+        let a = save(&pool, &scope, "a", "a", "note", &[], chunk(), "test", &[]).await?;
+        let b = save(&pool, &scope, "b", "b", "note", &[], chunk(), "test", &[]).await?;
+        let c = save(&pool, &scope, "c", "c", "note", &[], chunk(), "test", &[]).await?;
+        // Already superseded, so a later merge must leave it alone rather than
+        // rewrite whose replacement it was.
+        let replaced_c = save(
+            &pool,
+            &scope,
+            "c2",
+            "c2",
+            "note",
+            &[],
+            chunk(),
+            "test",
+            &[c.id],
+        )
+        .await?;
+        assert_eq!(replaced_c.retired, vec![c.id]);
+        // In another project entirely: unreachable from this namespace's writes.
+        let foreign = save(&pool, &other, "f", "f", "note", &[], chunk(), "test", &[]).await?;
+
+        let merged = save(
+            &pool,
+            &scope,
+            "merged",
+            "merged",
+            "note",
+            &[],
+            chunk(),
+            "test",
+            &[a.id, b.id, c.id, foreign.id],
+        )
+        .await?;
+        assert_eq!(merged.retired, vec![a.id, b.id]);
+
+        let row = get(&pool, &scope, merged.id).await?.expect("merged row");
+        assert_eq!(row.supersedes, vec![a.id, b.id]);
+
+        for id in [a.id, b.id] {
+            assert!(
+                get(&pool, &scope, id).await?.is_some(),
+                "a superseded row is hidden from search, not deleted"
+            );
+        }
+
+        sqlx::query("DELETE FROM memory WHERE client_id = $1")
+            .bind(&scope.client_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
 }

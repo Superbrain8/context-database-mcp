@@ -59,9 +59,28 @@ capped: an exact token match is its own evidence.
 
 One vector per memory works for a two-sentence note and fails for a long one — averaging a
 3,000-word document into a single 1024-d vector blurs every specific thing in it. Bodies are split
-into ~700-character overlapping chunks (on paragraph, then sentence, then whitespace boundaries) and
+into overlapping chunks of ~200 tokens (on paragraph, then sentence, then whitespace boundaries) and
 each chunk is embedded separately. A short body produces exactly one chunk, so there is no special
 case.
+
+**Chunks are sized in tokens, measured by the embedding model's own tokenizer** — the server's
+`/tokenize` route, not a vendored copy that would drift the moment the model changed. Characters were
+the wrong unit and the error was not small. Measured with bge-m3, a 700-character window holds:
+
+| text | chars/token | tokens in 700 chars |
+|---|---|---|
+| English prose | 3.57 | 196 |
+| German | 4.43 | 158 |
+| Rust source | 1.94 | 361 |
+| Chinese | 1.57 | 447 |
+
+So a CJK chunk was averaging 2.3× as much meaning into one vector as an English one, and getting
+correspondingly blurrier. Sizing in tokens holds every chunk to 134–201 tokens across all four,
+letting the character count vary instead. It costs one extra round trip per save — free in
+availability terms, since anything that chunks is about to embed anyway.
+
+Chunk boundaries change with this, so rows written before it keep their old ones until `--reindex`
+runs.
 
 A memory scores by its **single best-matching chunk**, collapsed with `DISTINCT ON`. Without that
 collapse, one long memory would fill several of the top slots with its own chunks and crowd
@@ -78,7 +97,14 @@ Closer to how human memory behaves, and it keeps an audit trail:
 
 - **correct** something → `context_save` with `supersedes`. The new row is written, the old one gets
   `superseded_by` set and disappears from search. Both stay on disk.
+- **merge** several overlapping memories → the same `supersedes`, given a list of ids. One save
+  retires the whole group, so the corpus is never left half-merged. See
+  [`--consolidate`](#8-maintenance-consolidate).
 - **drop** something → `context_forget`. Soft delete via `forgotten_at`; recoverable by hand.
+
+A save reports which ids it actually retired. An id belonging to another project, or one that was
+already superseded, is left alone and named in the reply — a merge that silently leaves one of its
+originals in search would look like it worked.
 
 The only in-place update the system performs is the access-stats bump in `context_get`.
 
@@ -284,6 +310,8 @@ CTXDB_CLIENT_ID=claude-code ./context-database-mcp --reindex             # do it
   badly.
 - Interrupting it is safe. Committed rows stay committed and a rerun finishes the job — the operation
   is idempotent. Take a `pg_dump -Fc` before the first real run anyway.
+- **Both modes need the embedding server**, including `--dry-run`: chunk boundaries come from its
+  tokenizer, so a dry run without it would compare the stored text against boundaries nobody will use.
 - `--dry-run` compares stored chunk text, not chunk counts. The chunker fix that motivated this moved
   boundaries inside rows whose count never changed: 30 of 42 rows were stale while every count matched.
 
@@ -318,6 +346,45 @@ search together, which is occasionally what you want and usually not.
 `--pin` and `--restore` are scoped like every other write — same `client_id`, same namespace. A row
 in another project is deliberately unreachable.
 
+### 8. Maintenance: `--consolidate`
+
+An append-only store accumulates near-duplicates: the same constraint learned twice, a decision
+recorded when it was made and again when it was questioned, four session summaries covering one
+week. None of them is wrong, and together they push the real answer down the ranking behind three
+paraphrases of itself.
+
+```bash
+$BIN --consolidate                      # clusters within 0.22 cosine, 10 shown
+$BIN --consolidate 25 --threshold 0.26  # wider, more clusters
+```
+
+```
+1 cluster(s) of overlapping memories in Context_Database_MCP (chunks within 0.22 cosine)
+
+cluster 1 -- 3 memories, 46209 chars, closest pair 0.13
+  [id=48] (session-summary) session summary 2026-08-01 18:41 | 17839 chars | 2026-08-01
+  [id=51] (session-summary) session summary 2026-08-01 19:46 | 14103 chars | 2026-08-01
+  [id=56] (session-summary) session summary 2026-08-02 07:29 | 14267 chars | 2026-08-02
+  merge: read these with context_get, then context_save the merged text with supersedes=[48, 51, 56]
+```
+
+**It reports; it does not merge**, for the same reason `--stale` does not delete — and for one more:
+nothing in this stack can write the merged text. The embedding server turns text into vectors and
+cannot produce a sentence. The only thing here that can summarise is the model reading the report,
+which is why the output ends in the exact tool call to make.
+
+Memories are compared **chunk to chunk, taking the minimum**, not as whole documents. A long note
+that repeats one paragraph of another averages out to "unrelated", and that repeated paragraph is
+exactly what is worth merging.
+
+Clusters are transitive: if A overlaps B and B overlaps C, all three are one decision even when A and
+C are far apart. That is how a topic actually accretes — but it is also how a slightly loose cutoff
+swallows a whole subject area. Measured on this project's own corpus, the collapse is steep: **0.22
+groups 3 memories, 0.26 groups 7, 0.28 groups 10, 0.35 groups 13 into one cluster.** Past roughly
+0.25 the chaining stops finding duplicates and starts finding the topic, so the default is 0.22 and
+any cluster of six or more is printed with a warning. A missed cluster costs nothing; a bad merge
+destroys the distinction between a rule and its exception, which look identical to a distance metric.
+
 ## Operational notes
 
 - **stdout is the MCP transport.** All logging goes to stderr. A stray `println!` corrupts the
@@ -336,6 +403,19 @@ missing-id path, and cross-project reads with narrow writes across three concurr
 processes. `cargo test` covers the chunker, including multi-byte input that byte-offset slicing
 would panic on.
 
+Token chunking is verified against the live tokenizer, in a test that is `#[ignore]`d for the same
+reason: four scripts (English, German, Rust, Chinese) chunked and then re-tokenized chunk by chunk.
+All four land in 134–201 tokens per chunk while their byte lengths spread from 326 to 978 — which is
+the whole claim. A chunk re-tokenized on its own can come out a token or two over budget, because
+subword merges depend on what preceded them; the budget is about keeping vectors comparable, not a
+hard cap, and bge-m3 accepts 8192.
+
+Consolidation was verified the same way. `--consolidate` was calibrated against the live 45-memory
+corpus at five cutoffs, and the supersede bookkeeping has a database-backed test — ignored in CI,
+which reaches no Postgres, and run by hand with `cargo test -- --ignored`. It asserts that a merge
+retires exactly the rows it names, leaves alone an id from another project and one that was already
+superseded, and that every retired row is still readable by id.
+
 Retrieval behaves as intended on both halves of the hybrid: a paraphrase query with no shared
 keywords is answered by the dense ranker alone, and an exact identifier (`ivfflat`) ranks first in
 both rankers. Chunking was verified against a 4,000-character document with one specific instruction
@@ -344,12 +424,17 @@ returned the containing chunk as the snippet.
 
 ## Not done yet
 
-- Nothing ages out or gets consolidated. `--stale` surfaces the candidates, but forgetting is always
-  a human call, and there is no summarisation of related memories into one.
-- Chunk boundaries are character-based, not token-based, so a chunk can land slightly over or under
-  what the model would consider a natural passage.
+- Nothing ages out on its own. `--stale` and `--consolidate` surface the candidates and a save or a
+  forget is always a deliberate call — no timer evicts, and no merge happens without the model
+  writing the merged text.
+- `--consolidate` compares every live chunk against every other one. That is a few tens of thousands
+  of comparisons here and fine; `<=>` between two table columns cannot use the HNSW index, so it is
+  the first thing that needs rethinking at tens of thousands of chunks.
 - Chunk boundaries are fixed at save time; `--reindex` carries a chunker fix backwards, but it has to
   be run by hand and re-embeds the whole corpus rather than only the rows that changed.
+- Token counts come from the server, so chunking needs the embedder reachable — which it always is on
+  a write path. An embedding server with no `/tokenize` route falls back to the old character-based
+  chunker and says so in the log.
 
 ## CI
 

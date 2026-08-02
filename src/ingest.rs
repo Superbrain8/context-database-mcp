@@ -122,12 +122,14 @@ async fn store(
         trigger
     );
 
-    let (pieces, inputs) = embed::chunk_inputs(&title, summary);
+    // The embedder is built first now: chunk boundaries come from its tokenizer,
+    // not from a character count.
+    let embedder = embed::Embedder::new(embed_url, embed_model);
+    let (pieces, inputs) = embedder.chunk_inputs(&title, summary).await?;
     if pieces.is_empty() {
         return Ok(());
     }
 
-    let embedder = embed::Embedder::new(embed_url, embed_model);
     let embeddings = embedder.embed(&inputs).await?;
     if embeddings.len() != pieces.len() {
         anyhow::bail!(
@@ -155,9 +157,13 @@ async fn store(
         ],
         chunks,
         embedder.model(),
-        None,
+        // A compaction summary supersedes nothing: the previous session's
+        // summary is a record of a different session, not a worse version of
+        // this one.
+        &[],
     )
-    .await?;
+    .await?
+    .id;
 
     tracing::info!(
         namespace = %scope.namespace,

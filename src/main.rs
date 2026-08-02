@@ -5,6 +5,7 @@
 //! cannot address another client's memory even if it tries.
 
 mod admin;
+mod consolidate;
 mod db;
 mod embed;
 mod ingest;
@@ -55,11 +56,38 @@ struct SaveParams {
     /// Lowercase keywords for filtering, e.g. ["auth", "postgres"].
     #[serde(default)]
     tags: Option<Vec<String>>,
-    /// Id of a memory this one corrects or replaces. The old memory stops
-    /// appearing in search. Use this instead of trying to edit -- memories are
-    /// append-only.
+    /// Id, or list of ids, that this memory corrects or replaces. Those memories
+    /// stop appearing in search. Use this instead of trying to edit -- memories
+    /// are append-only. Pass several ids to consolidate overlapping memories
+    /// into one merged memory.
     #[serde(default)]
-    supersedes: Option<i64>,
+    supersedes: Option<Supersedes>,
+}
+
+/// One id or several.
+///
+/// Untagged rather than plain `Vec<i64>`: correcting a single memory is by far
+/// the common call, `supersedes: 42` is what a model writes unprompted, and
+/// rejecting it as a type error would cost a retry on the most frequent path.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum Supersedes {
+    One(i64),
+    Many(Vec<i64>),
+}
+
+impl Supersedes {
+    /// Deduplicated, because `[7, 7]` would otherwise report one retired id out
+    /// of two requested and read as a failure.
+    fn ids(&self) -> Vec<i64> {
+        let mut ids = match self {
+            Supersedes::One(id) => vec![*id],
+            Supersedes::Many(v) => v.clone(),
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -119,8 +147,12 @@ impl ContextDb {
         let tags = p.tags.unwrap_or_default();
 
         // Long bodies are split so each vector covers one coherent passage; a
-        // short body yields a single chunk.
-        let (pieces, inputs) = embed::chunk_inputs(&p.title, &p.body);
+        // short body yields a single chunk. Sized by the embedding model's own
+        // tokenizer, so this costs a round trip before the embedding one.
+        let (pieces, inputs) = match self.embedder.chunk_inputs(&p.title, &p.body).await {
+            Ok(v) => v,
+            Err(e) => return format!("ERROR: chunking failed: {e:#}"),
+        };
         if pieces.is_empty() {
             return "ERROR: body is empty".to_string();
         }
@@ -141,6 +173,12 @@ impl ContextDb {
         let chunks: Vec<(String, Vec<f32>)> = pieces.into_iter().zip(embeddings).collect();
         let chunk_count = chunks.len();
 
+        let asked: Vec<i64> = p
+            .supersedes
+            .as_ref()
+            .map(Supersedes::ids)
+            .unwrap_or_default();
+
         match db::save(
             &self.pool,
             &self.scope,
@@ -150,22 +188,48 @@ impl ContextDb {
             &tags,
             chunks,
             self.embedder.model(),
-            p.supersedes,
+            &asked,
         )
         .await
         {
-            Ok(id) => {
+            Ok(saved) => {
+                let id = saved.id;
                 let split = if chunk_count > 1 {
                     format!(" in {chunk_count} chunks")
                 } else {
                     String::new()
                 };
-                match p.supersedes {
-                    Some(old) => format!(
-                        "saved id={id}{split} (supersedes id={old}, which is now retired)"
-                    ),
-                    None => format!("saved id={id}{split}"),
+                if asked.is_empty() {
+                    return format!("saved id={id}{split}");
                 }
+
+                // A requested id that was not retired is reported, never
+                // swallowed: it means the id belongs to another project or was
+                // already superseded, and a merge that silently leaves one of
+                // its originals in search looks like it worked.
+                let missed: Vec<String> = asked
+                    .iter()
+                    .filter(|id| !saved.retired.contains(id))
+                    .map(i64::to_string)
+                    .collect();
+                let retired = saved
+                    .retired
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut out = if saved.retired.is_empty() {
+                    format!("saved id={id}{split} (nothing was retired)")
+                } else {
+                    format!("saved id={id}{split} (retired id={retired})")
+                };
+                if !missed.is_empty() {
+                    out.push_str(&format!(
+                        " -- id={} left alone: not in this project, or already superseded",
+                        missed.join(", ")
+                    ));
+                }
+                out
             }
             Err(e) => format!("ERROR: save failed: {e:#}"),
         }
@@ -241,10 +305,18 @@ impl ContextDb {
     async fn context_get(&self, Parameters(p): Parameters<GetParams>) -> String {
         match db::get(&self.pool, &self.scope, p.id).await {
             Ok(Some(m)) => {
-                let supersedes = m
-                    .supersedes_id
-                    .map(|s| format!(" (supersedes id={s})"))
-                    .unwrap_or_default();
+                let supersedes = if m.supersedes.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (supersedes id={})",
+                        m.supersedes
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
                 let origin = if m.namespace == self.scope.namespace {
                     String::new()
                 } else {
@@ -312,7 +384,8 @@ impl rmcp::ServerHandler for ContextDb {
              that is not obvious from the code, the root cause of a bug, a user preference. \
              Do not save what is trivially re-derivable by reading the code.\n\n\
              Memories are append-only. To correct one, save a new memory with `supersedes` \
-             set to the old id rather than trying to edit it."
+             set to the old id rather than trying to edit it, or to several ids to replace a \
+             group of overlapping memories with one merged memory."
                 .to_string(),
         );
         info
@@ -466,6 +539,20 @@ fn limit_after(args: &[String], flag: &str, default: i64) -> i64 {
         .clamp(1, 200)
 }
 
+/// A cosine distance from the command line, clamped to the range the metric can
+/// actually produce for these embeddings.
+///
+/// Silently clamping rather than erroring, because both ends are harmless: 0
+/// finds only identical text and 1 finds everything, and the report says which
+/// cutoff it used.
+fn threshold_after(args: &[String], flag: &str, default: f64) -> f64 {
+    arg_after(args, flag)
+        .and_then(|n| n.parse::<f64>().ok())
+        .filter(|d| d.is_finite())
+        .unwrap_or(default)
+        .clamp(0.0, 1.0)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // stdout is the MCP transport. Any stray byte written there corrupts the
@@ -529,6 +616,19 @@ async fn main() -> anyhow::Result<()> {
     // are occasional human decisions, not conversational ones.
     if args.iter().any(|a| a == "--stale") {
         return admin::stale(&database_url, &scope, limit_after(&args, "--stale", 20)).await;
+    }
+    // `--consolidate [N] [--threshold D]`: clusters of overlapping memories. A
+    // report like `--stale`: it cannot write the merged text -- an embedding
+    // server makes vectors, not sentences -- so it hands the model the ids and
+    // the tool call to make.
+    if args.iter().any(|a| a == "--consolidate") {
+        return consolidate::run(
+            &database_url,
+            &scope,
+            threshold_after(&args, "--threshold", consolidate::DEFAULT_THRESHOLD),
+            limit_after(&args, "--consolidate", 10),
+        )
+        .await;
     }
     if args.iter().any(|a| a == "--history") {
         return admin::history(&database_url, &scope, limit_after(&args, "--history", 20)).await;
@@ -614,6 +714,26 @@ mod tests {
         // A hand-typed `--stale 100000` should print a big report, not fail.
         let a = args(&["bin", "--stale", "100000"]);
         assert_eq!(limit_after(&a, "--stale", 20), 200);
+    }
+
+    #[test]
+    fn a_threshold_is_clamped_to_the_metrics_range() {
+        let at = |v: &str| threshold_after(&args(&["bin", "--threshold", v]), "--threshold", 0.22);
+        assert_eq!(at("0.3"), 0.3);
+        assert_eq!(at("9"), 1.0);
+        // Garbage falls back to the default rather than to 0, which would report
+        // no clusters and look like a clean corpus.
+        assert_eq!(at("x"), 0.22);
+    }
+
+    #[test]
+    fn supersedes_accepts_one_id_or_many() {
+        let one: Supersedes = serde_json::from_str("42").unwrap();
+        assert_eq!(one.ids(), vec![42]);
+        let many: Supersedes = serde_json::from_str("[7, 3, 7]").unwrap();
+        // Sorted and deduplicated: a repeated id would otherwise be reported as
+        // one retired out of two asked for, which reads as a partial failure.
+        assert_eq!(many.ids(), vec![3, 7]);
     }
 
     #[test]
