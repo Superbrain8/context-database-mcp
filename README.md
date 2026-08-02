@@ -287,6 +287,37 @@ CTXDB_CLIENT_ID=claude-code ./context-database-mcp --reindex             # do it
 - `--dry-run` compares stored chunk text, not chunk counts. The chunker fix that motivated this moved
   boundaries inside rows whose count never changed: 30 of 42 rows were stale while every count matched.
 
+### 7. Maintenance: reviewing, pinning, restoring
+
+```bash
+BIN=./context-database-mcp; export CTXDB_CLIENT_ID=claude-code
+
+$BIN --stale 20          # least-read live memories, never-read first
+$BIN --history 20        # what search cannot see: forgotten, superseded, expired
+$BIN --pin 46            # always push this one at session start
+$BIN --unpin 46
+$BIN --restore 50        # undo a forget
+$BIN --restore 50 --detach   # ...and cut the link to whatever superseded it
+```
+
+These are CLI modes, not MCP tools, and that is deliberate. Every tool exposed to the model costs
+schema tokens in **every** session whether it gets used or not, and these are occasional human
+decisions — pinning is a standing judgement about what future sessions should be told exists, and
+restoring is an undo for a mistake the model itself made.
+
+**`--stale` reports; it never deletes.** Nothing here evicts on a timer. For a store whose entire
+promise is not forgetting, an automatic eviction that guesses wrong fails silently and is discovered
+months later by a search that finds nothing. Reads count `context_get` only — search hits do not bump
+the counter, which makes "keeps surfacing, never opened" visible as `reads=0`.
+
+**`--restore` is honest about what is still hidden.** A row can be both forgotten *and* superseded,
+so clearing `forgotten_at` alone leaves it exactly as invisible as before; the command says so and
+names the row in the way. `--detach` is opt-in because it puts a memory and its correction back in
+search together, which is occasionally what you want and usually not.
+
+`--pin` and `--restore` are scoped like every other write — same `client_id`, same namespace. A row
+in another project is deliberately unreachable.
+
 ## Operational notes
 
 - **stdout is the MCP transport.** All logging goes to stderr. A stray `println!` corrupts the
@@ -313,10 +344,8 @@ returned the containing chunk as the snippet.
 
 ## Not done yet
 
-- No eviction or summarisation. Memories accumulate forever; nothing ages out or gets consolidated.
-- `pinned` exists in the schema and is honoured by `--recent`, but no tool sets it.
-- Superseded and forgotten rows are never reaped, by design — but there is no tool to review or
-  restore them either.
+- Nothing ages out or gets consolidated. `--stale` surfaces the candidates, but forgetting is always
+  a human call, and there is no summarisation of related memories into one.
 - Chunk boundaries are character-based, not token-based, so a chunk can land slightly over or under
   what the model would consider a natural passage.
 - Chunk boundaries are fixed at save time; `--reindex` carries a chunker fix backwards, but it has to
