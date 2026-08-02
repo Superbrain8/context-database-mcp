@@ -147,8 +147,12 @@ impl ContextDb {
         let tags = p.tags.unwrap_or_default();
 
         // Long bodies are split so each vector covers one coherent passage; a
-        // short body yields a single chunk.
-        let (pieces, inputs) = embed::chunk_inputs(&p.title, &p.body);
+        // short body yields a single chunk. Sized by the embedding model's own
+        // tokenizer, so this costs a round trip before the embedding one.
+        let (pieces, inputs) = match self.embedder.chunk_inputs(&p.title, &p.body).await {
+            Ok(v) => v,
+            Err(e) => return format!("ERROR: chunking failed: {e:#}"),
+        };
         if pieces.is_empty() {
             return "ERROR: body is empty".to_string();
         }

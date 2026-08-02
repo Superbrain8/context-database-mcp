@@ -59,9 +59,28 @@ capped: an exact token match is its own evidence.
 
 One vector per memory works for a two-sentence note and fails for a long one — averaging a
 3,000-word document into a single 1024-d vector blurs every specific thing in it. Bodies are split
-into ~700-character overlapping chunks (on paragraph, then sentence, then whitespace boundaries) and
+into overlapping chunks of ~200 tokens (on paragraph, then sentence, then whitespace boundaries) and
 each chunk is embedded separately. A short body produces exactly one chunk, so there is no special
 case.
+
+**Chunks are sized in tokens, measured by the embedding model's own tokenizer** — the server's
+`/tokenize` route, not a vendored copy that would drift the moment the model changed. Characters were
+the wrong unit and the error was not small. Measured with bge-m3, a 700-character window holds:
+
+| text | chars/token | tokens in 700 chars |
+|---|---|---|
+| English prose | 3.57 | 196 |
+| German | 4.43 | 158 |
+| Rust source | 1.94 | 361 |
+| Chinese | 1.57 | 447 |
+
+So a CJK chunk was averaging 2.3× as much meaning into one vector as an English one, and getting
+correspondingly blurrier. Sizing in tokens holds every chunk to 134–201 tokens across all four,
+letting the character count vary instead. It costs one extra round trip per save — free in
+availability terms, since anything that chunks is about to embed anyway.
+
+Chunk boundaries change with this, so rows written before it keep their old ones until `--reindex`
+runs.
 
 A memory scores by its **single best-matching chunk**, collapsed with `DISTINCT ON`. Without that
 collapse, one long memory would fill several of the top slots with its own chunks and crowd
@@ -291,6 +310,8 @@ CTXDB_CLIENT_ID=claude-code ./context-database-mcp --reindex             # do it
   badly.
 - Interrupting it is safe. Committed rows stay committed and a rerun finishes the job — the operation
   is idempotent. Take a `pg_dump -Fc` before the first real run anyway.
+- **Both modes need the embedding server**, including `--dry-run`: chunk boundaries come from its
+  tokenizer, so a dry run without it would compare the stored text against boundaries nobody will use.
 - `--dry-run` compares stored chunk text, not chunk counts. The chunker fix that motivated this moved
   boundaries inside rows whose count never changed: 30 of 42 rows were stale while every count matched.
 
@@ -382,6 +403,13 @@ missing-id path, and cross-project reads with narrow writes across three concurr
 processes. `cargo test` covers the chunker, including multi-byte input that byte-offset slicing
 would panic on.
 
+Token chunking is verified against the live tokenizer, in a test that is `#[ignore]`d for the same
+reason: four scripts (English, German, Rust, Chinese) chunked and then re-tokenized chunk by chunk.
+All four land in 134–201 tokens per chunk while their byte lengths spread from 326 to 978 — which is
+the whole claim. A chunk re-tokenized on its own can come out a token or two over budget, because
+subword merges depend on what preceded them; the budget is about keeping vectors comparable, not a
+hard cap, and bge-m3 accepts 8192.
+
 Consolidation was verified the same way. `--consolidate` was calibrated against the live 45-memory
 corpus at five cutoffs, and the supersede bookkeeping has a database-backed test — ignored in CI,
 which reaches no Postgres, and run by hand with `cargo test -- --ignored`. It asserts that a merge
@@ -402,10 +430,11 @@ returned the containing chunk as the snippet.
 - `--consolidate` compares every live chunk against every other one. That is a few tens of thousands
   of comparisons here and fine; `<=>` between two table columns cannot use the HNSW index, so it is
   the first thing that needs rethinking at tens of thousands of chunks.
-- Chunk boundaries are character-based, not token-based, so a chunk can land slightly over or under
-  what the model would consider a natural passage.
 - Chunk boundaries are fixed at save time; `--reindex` carries a chunker fix backwards, but it has to
   be run by hand and re-embeds the whole corpus rather than only the rows that changed.
+- Token counts come from the server, so chunking needs the embedder reachable — which it always is on
+  a write path. An embedding server with no `/tokenize` route falls back to the old character-based
+  chunker and says so in the log.
 
 ## CI
 

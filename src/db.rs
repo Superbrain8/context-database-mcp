@@ -933,7 +933,15 @@ mod tests {
         // Already superseded, so a later merge must leave it alone rather than
         // rewrite whose replacement it was.
         let replaced_c = save(
-            &pool, &scope, "c2", "c2", "note", &[], chunk(), "test", &[c.id],
+            &pool,
+            &scope,
+            "c2",
+            "c2",
+            "note",
+            &[],
+            chunk(),
+            "test",
+            &[c.id],
         )
         .await?;
         assert_eq!(replaced_c.retired, vec![c.id]);
