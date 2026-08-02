@@ -29,6 +29,17 @@ services:
       - --model-id=BAAI/bge-m3
       - --pooling=cls
       - --max-client-batch-size=64
+      # Both flags exist to cap idle RAM, and both were measured on this stack.
+      # The ONNX backend sizes its CPU arena on the warmup batch and never
+      # returns it, so the default --max-batch-tokens=16384 against a model with
+      # an 8192-token limit parks ~16 GB before a single request arrives.
+      # Chunks are 200 tokens, so 2048 is 10x headroom; it is a scheduler hint,
+      # not a reject -- a larger single input still embeds (auto-truncate).
+      - --max-batch-tokens=2048
+      # One tokenizer copy per worker, and bge-m3's is a 250k-vocab sentencepiece
+      # (~92 MB each). Defaults to one per core. Embedding is inference-bound
+      # here -- 64 chunks took 7.6s on 31 workers and 7.5s on 4.
+      - --tokenization-workers=4
     ports:
       - "127.0.0.1:8085:80"
     volumes:
