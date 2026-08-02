@@ -7,6 +7,7 @@
 mod db;
 mod embed;
 mod ingest;
+mod reindex;
 
 use std::sync::Arc;
 
@@ -117,17 +118,11 @@ impl ContextDb {
         let tags = p.tags.unwrap_or_default();
 
         // Long bodies are split so each vector covers one coherent passage; a
-        // short body yields a single chunk. The title is prepended to every
-        // chunk, so a chunk from the middle of a long note still carries what
-        // the note is about.
-        let pieces = embed::chunk_text(&p.body);
+        // short body yields a single chunk.
+        let (pieces, inputs) = embed::chunk_inputs(&p.title, &p.body);
         if pieces.is_empty() {
             return "ERROR: body is empty".to_string();
         }
-        let inputs: Vec<String> = pieces
-            .iter()
-            .map(|c| format!("{}\n\n{}", p.title, c))
-            .collect();
 
         // One request for all chunks -- the embedding server batches far better
         // than a round trip per chunk.
@@ -491,6 +486,15 @@ async fn main() -> anyhow::Result<()> {
     // exactly the cost this mode exists to avoid.
     if args.iter().any(|a| a == "--ingest") {
         return ingest::run(&database_url, embed_url, embed_model, scope).await;
+    }
+
+    // `--reindex [--dry-run]`: recompute chunks and embeddings for every stored
+    // memory. An operator command, run by hand after a chunker or model change --
+    // no hook calls it, and unlike the hook paths it reports failure instead of
+    // swallowing it.
+    if args.iter().any(|a| a == "--reindex") {
+        let dry_run = args.iter().any(|a| a == "--dry-run");
+        return reindex::run(&database_url, embed_url, embed_model, &scope, dry_run).await;
     }
 
     tracing::info!(

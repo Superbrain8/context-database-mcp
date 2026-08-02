@@ -122,14 +122,10 @@ async fn store(
         trigger
     );
 
-    let pieces = embed::chunk_text(summary);
+    let (pieces, inputs) = embed::chunk_inputs(&title, summary);
     if pieces.is_empty() {
         return Ok(());
     }
-    let inputs: Vec<String> = pieces
-        .iter()
-        .map(|c| format!("{title}\n\n{c}"))
-        .collect();
 
     let embedder = embed::Embedder::new(embed_url, embed_model);
     let embeddings = embedder.embed(&inputs).await?;

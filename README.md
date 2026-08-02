@@ -259,6 +259,34 @@ somewhere else. Re-running the hook on the same summary is a no-op — an identi
 namespace is treated as already stored. Like `--recent`, this mode prints nothing to stdout and
 exits 0 on every failure: anything it printed would land straight in the freshly compacted context.
 
+### 6. Maintenance: `--reindex`
+
+Chunk boundaries and embeddings are computed at save time, so a chunker fix never reaches rows
+already stored. `--reindex` recomputes both from the body, which is the only thing it treats as
+source of truth:
+
+```bash
+CTXDB_CLIENT_ID=claude-code ./context-database-mcp --reindex --dry-run   # report, write nothing
+CTXDB_CLIENT_ID=claude-code ./context-database-mcp --reindex             # do it
+```
+
+- **`memory.body` is never written.** Chunks are derived data, so replacing them does not break the
+  append-only rule — that rule protects memories, not derivatives. The flip side: reindexing cannot
+  repair a *polluted body*, it just re-chunks the same text. That needs a re-ingest plus a supersede.
+- **All or nothing.** It covers the whole `client_id`, every namespace, because the HNSW index is
+  shared: re-embedding half a corpus with a second model mixes incomparable vectors and degrades
+  ranking with no error anywhere. It refuses to start if the corpus holds a model other than
+  `CTXDB_EMBED_MODEL`.
+- **One transaction per memory**, and it refuses to write an empty chunk set. A row left with zero
+  chunks vanishes from dense search silently and only surfaces when a search stops finding something.
+- Forgotten rows are skipped. Superseded and expired rows are not: they are invisible to search but
+  still restorable, and restoring one onto stale boundaries would restore something that retrieves
+  badly.
+- Interrupting it is safe. Committed rows stay committed and a rerun finishes the job — the operation
+  is idempotent. Take a `pg_dump -Fc` before the first real run anyway.
+- `--dry-run` compares stored chunk text, not chunk counts. The chunker fix that motivated this moved
+  boundaries inside rows whose count never changed: 30 of 42 rows were stale while every count matched.
+
 ## Operational notes
 
 - **stdout is the MCP transport.** All logging goes to stderr. A stray `println!` corrupts the
@@ -291,8 +319,8 @@ returned the containing chunk as the snippet.
   restore them either.
 - Chunk boundaries are character-based, not token-based, so a chunk can land slightly over or under
   what the model would consider a natural passage.
-- Chunk boundaries are fixed at save time, so improvements to the chunker never reach rows already
-  stored. There is no `--reindex` mode to re-chunk and re-embed them.
+- Chunk boundaries are fixed at save time; `--reindex` carries a chunker fix backwards, but it has to
+  be run by hand and re-embeds the whole corpus rather than only the rows that changed.
 
 ## CI
 
