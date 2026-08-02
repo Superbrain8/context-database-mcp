@@ -131,6 +131,12 @@ docker compose up -d
 First start downloads bge-m3 (~2.2 GB) into the `hfcache` volume. Watch it with
 `docker logs -f ctxdb-embed`; the server is ready when `/health` returns 200.
 
+Idle footprint is ~2.5 GB for the embedder and ~40 MB for Postgres. Almost all of the embedder's
+share is model weights and it is resident whether or not anything is searching — TEI's ONNX CPU
+backend sizes its arena during warmup and never gives it back. That is also why the compose file
+pins `--max-batch-tokens` and `--tokenization-workers`: on the defaults the same container parks
+16 GB before serving a single request, at identical vectors and identical throughput.
+
 Files in `migrations/` are applied automatically, but **only on a fresh `pgdata` volume**. A
 database that already holds memories must have new migrations applied by hand — dropping the volume
 to change schema is not an option for a store whose entire job is to not forget things:
