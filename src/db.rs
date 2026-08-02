@@ -302,6 +302,146 @@ pub async fn find_by_body(pool: &PgPool, scope: &Scope, body: &str) -> Result<Op
     Ok(row.map(|r| r.get("id")))
 }
 
+#[derive(Debug)]
+pub struct ReindexRow {
+    pub id: i64,
+    pub namespace: String,
+    pub title: String,
+    pub body: String,
+    /// How many chunks the row carries right now, for the before/after report.
+    pub chunks: i64,
+}
+
+/// Every embedding model present in this client's corpus.
+///
+/// `--reindex` refuses to run when this holds anything but the model it is
+/// configured with. Re-embedding part of a corpus with a different model mixes
+/// incomparable vectors inside one HNSW index, and the damage is silent: nothing
+/// errors, ranking simply gets worse.
+pub async fn embed_models_in_use(pool: &PgPool, client_id: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT embed_model FROM memory
+        WHERE client_id = $1 AND forgotten_at IS NULL
+        ORDER BY embed_model
+        "#,
+    )
+    .bind(client_id)
+    .fetch_all(pool)
+    .await
+    .context("listing embedding models in use")?;
+
+    Ok(rows.into_iter().map(|r| r.get("embed_model")).collect())
+}
+
+/// Everything `--reindex` will rewrite: the whole client corpus, every
+/// namespace, forgotten rows excluded.
+///
+/// Not restricted to `memory_live`. A superseded or expired row is invisible to
+/// search today but still on disk and still restorable, and leaving it on stale
+/// chunk boundaries would mean restoring it later restores something that
+/// retrieves badly.
+pub async fn rows_to_reindex(pool: &PgPool, client_id: &str) -> Result<Vec<ReindexRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT m.id, m.namespace, m.title, m.body,
+               (SELECT count(*) FROM memory_chunk c WHERE c.memory_id = m.id) AS chunks
+        FROM memory m
+        WHERE m.client_id = $1 AND m.forgotten_at IS NULL
+        ORDER BY m.id
+        "#,
+    )
+    .bind(client_id)
+    .fetch_all(pool)
+    .await
+    .context("listing rows to reindex")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ReindexRow {
+            id: r.get("id"),
+            namespace: r.get("namespace"),
+            title: r.get("title"),
+            body: r.get("body"),
+            chunks: r.get("chunks"),
+        })
+        .collect())
+}
+
+/// One memory's stored chunk text, in order.
+///
+/// Used by `--reindex --dry-run` to say whether a row is actually stale. Chunk
+/// *count* is the wrong test on its own: a chunker fix that moves boundaries
+/// without adding or removing a chunk changes every embedding in the row and
+/// leaves the count untouched.
+pub async fn chunk_texts(pool: &PgPool, memory_id: i64) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT text FROM memory_chunk WHERE memory_id = $1 ORDER BY ord")
+        .bind(memory_id)
+        .fetch_all(pool)
+        .await
+        .context("reading stored chunk text")?;
+
+    Ok(rows.into_iter().map(|r| r.get("text")).collect())
+}
+
+/// Swap one memory's chunks for freshly computed ones.
+///
+/// `memory.body` is never touched: chunks are derived data, the body is the
+/// source of truth. That is also why deleting and reinserting chunk rows does
+/// not violate the append-only rule -- that rule protects memories, not
+/// derivatives.
+///
+/// Delete and insert share one transaction because the failure to design against
+/// is a row left with zero chunks: it disappears from dense search with no error
+/// at all, and only surfaces months later as a search that stops finding
+/// something. The empty-input guard covers the same hole from the other side.
+pub async fn replace_chunks(
+    pool: &PgPool,
+    memory_id: i64,
+    chunks: Vec<(String, Vec<f32>)>,
+    embed_model: &str,
+) -> Result<()> {
+    if chunks.is_empty() {
+        anyhow::bail!("refusing to leave memory id={memory_id} with no chunks");
+    }
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM memory_chunk WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&mut *tx)
+        .await
+        .context("deleting old chunks")?;
+
+    for (ord, (text, embedding)) in chunks.into_iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO memory_chunk (memory_id, ord, text, embedding)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(memory_id)
+        .bind(ord as i32)
+        .bind(&text)
+        .bind(Vector::from(embedding))
+        .execute(&mut *tx)
+        .await
+        .context("inserting reindexed chunk")?;
+    }
+
+    // The row now records which model its vectors actually came from, so a
+    // half-finished run is visible in the data rather than only in a log line.
+    sqlx::query("UPDATE memory SET embed_model = $2 WHERE id = $1")
+        .bind(memory_id)
+        .bind(embed_model)
+        .execute(&mut *tx)
+        .await
+        .context("recording the embedding model")?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Soft delete. The row stays on disk so a wrong forget can be undone by hand;
 /// nothing in the read path can see it again.
 pub async fn forget(pool: &PgPool, scope: &Scope, id: i64, reason: Option<&str>) -> Result<bool> {

@@ -187,6 +187,22 @@ pub fn chunk_text(text: &str) -> Vec<String> {
     chunks
 }
 
+/// Split a body into chunks and build the exact strings that get embedded.
+///
+/// Returns `(chunks, inputs)`: the chunk text as it is stored, and the text as
+/// it is sent to the embedder. They differ -- the title is prepended to every
+/// input, so a chunk from the middle of a long note still carries what the note
+/// is about.
+///
+/// Every writer goes through this. `--reindex` has to reproduce a save's inputs
+/// character for character, or a reindexed row lands somewhere else in the
+/// vector space than a freshly saved one and the two stop being comparable.
+pub fn chunk_inputs(title: &str, body: &str) -> (Vec<String>, Vec<String>) {
+    let chunks = chunk_text(body);
+    let inputs = chunks.iter().map(|c| format!("{title}\n\n{c}")).collect();
+    (chunks, inputs)
+}
+
 /// Best break point in `chars[floor..ceil]`, preferring a blank line, then a
 /// sentence end, then any whitespace. Returns the index just past the break.
 fn find_break(chars: &[char], floor: usize, ceil: usize) -> Option<usize> {
@@ -262,6 +278,21 @@ mod tests {
                 body.contains(&format!(" {first} ")) || body.starts_with(first),
                 "chunk {i} starts mid-word: {first:?}"
             );
+        }
+    }
+
+    #[test]
+    fn every_embed_input_carries_the_title() {
+        // The parity `--reindex` depends on: stored chunk text and embedded text
+        // are one transformation apart, applied in one place. If a writer ever
+        // builds its inputs by hand again, a reindexed row stops matching a
+        // freshly saved one.
+        let body = "Sentence number one is here. ".repeat(200);
+        let (chunks, inputs) = chunk_inputs("a title", &body);
+        assert_eq!(chunks.len(), inputs.len());
+        assert!(chunks.len() > 1);
+        for (c, i) in chunks.iter().zip(&inputs) {
+            assert_eq!(*i, format!("a title\n\n{c}"));
         }
     }
 
