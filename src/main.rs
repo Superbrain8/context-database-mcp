@@ -4,6 +4,7 @@
 //! from this process's environment, never from tool arguments -- the model
 //! cannot address another client's memory even if it tries.
 
+mod admin;
 mod db;
 mod embed;
 mod ingest;
@@ -439,6 +440,32 @@ async fn print_recent(database_url: &str, scope: &Scope, limit: i64) -> anyhow::
     Ok(())
 }
 
+/// The value following `flag`, if there is one and it is not itself a flag.
+///
+/// Rejecting a `--`-prefixed value matters: `--restore --detach` would otherwise
+/// read "--detach" as the id, fail to parse, and report a confusing error about
+/// the wrong argument.
+fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let pos = args.iter().position(|a| a == flag)?;
+    args.get(pos + 1)
+        .map(String::as_str)
+        .filter(|v| !v.starts_with("--"))
+}
+
+fn id_after(args: &[String], flag: &str) -> anyhow::Result<i64> {
+    let raw = arg_after(args, flag)
+        .ok_or_else(|| anyhow::anyhow!("{flag} needs a memory id, e.g. `{flag} 42`"))?;
+    raw.parse()
+        .map_err(|_| anyhow::anyhow!("{flag} takes a memory id, got {raw:?}"))
+}
+
+fn limit_after(args: &[String], flag: &str, default: i64) -> i64 {
+    arg_after(args, flag)
+        .and_then(|n| n.parse::<i64>().ok())
+        .unwrap_or(default)
+        .clamp(1, 200)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // stdout is the MCP transport. Any stray byte written there corrupts the
@@ -497,6 +524,26 @@ async fn main() -> anyhow::Result<()> {
         return reindex::run(&database_url, embed_url, embed_model, &scope, dry_run).await;
     }
 
+    // Operator modes. Kept off the MCP surface on purpose -- every tool costs
+    // schema tokens in every session whether the model uses it or not, and these
+    // are occasional human decisions, not conversational ones.
+    if args.iter().any(|a| a == "--stale") {
+        return admin::stale(&database_url, &scope, limit_after(&args, "--stale", 20)).await;
+    }
+    if args.iter().any(|a| a == "--history") {
+        return admin::history(&database_url, &scope, limit_after(&args, "--history", 20)).await;
+    }
+    if args.iter().any(|a| a == "--pin") {
+        return admin::pin(&database_url, &scope, id_after(&args, "--pin")?, true).await;
+    }
+    if args.iter().any(|a| a == "--unpin") {
+        return admin::pin(&database_url, &scope, id_after(&args, "--unpin")?, false).await;
+    }
+    if args.iter().any(|a| a == "--restore") {
+        let detach = args.iter().any(|a| a == "--detach");
+        return admin::restore(&database_url, &scope, id_after(&args, "--restore")?, detach).await;
+    }
+
     tracing::info!(
         client_id = %scope.client_id,
         namespace = %scope.namespace,
@@ -525,4 +572,53 @@ async fn main() -> anyhow::Result<()> {
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reads_the_value_after_a_flag() {
+        let a = args(&["bin", "--pin", "42"]);
+        assert_eq!(arg_after(&a, "--pin"), Some("42"));
+        assert_eq!(id_after(&a, "--pin").unwrap(), 42);
+    }
+
+    #[test]
+    fn a_following_flag_is_not_a_value() {
+        // `--restore 7 --detach` and `--restore --detach` must not be confused:
+        // the second is a mistake, and reading "--detach" as the id would report
+        // an error about the wrong argument.
+        let a = args(&["bin", "--restore", "--detach"]);
+        assert_eq!(arg_after(&a, "--restore"), None);
+        assert!(id_after(&a, "--restore").is_err());
+
+        let b = args(&["bin", "--restore", "7", "--detach"]);
+        assert_eq!(id_after(&b, "--restore").unwrap(), 7);
+    }
+
+    #[test]
+    fn a_flag_at_the_end_has_no_value() {
+        let a = args(&["bin", "--stale"]);
+        assert_eq!(arg_after(&a, "--stale"), None);
+        assert_eq!(limit_after(&a, "--stale", 20), 20);
+    }
+
+    #[test]
+    fn limits_are_clamped_rather_than_rejected() {
+        // A hand-typed `--stale 100000` should print a big report, not fail.
+        let a = args(&["bin", "--stale", "100000"]);
+        assert_eq!(limit_after(&a, "--stale", 20), 200);
+    }
+
+    #[test]
+    fn namespace_comes_from_the_folder_name() {
+        let ns = namespace_from_dir(std::path::Path::new("/home/x/Projects/api"));
+        assert_eq!(ns.as_deref(), Some("api"));
+    }
 }

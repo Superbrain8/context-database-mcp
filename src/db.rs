@@ -463,6 +463,209 @@ pub async fn forget(pool: &PgPool, scope: &Scope, id: i64, reason: Option<&str>)
     Ok(done.rows_affected() > 0)
 }
 
+#[derive(Debug)]
+pub struct StaleRow {
+    pub id: i64,
+    pub title: String,
+    pub kind: String,
+    pub pinned: bool,
+    /// `length(body)`, which Postgres returns as int4.
+    pub body_chars: i32,
+    pub access_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub accessed_at: DateTime<Utc>,
+}
+
+/// Live memories ordered by how little they have been read, for `--stale`.
+///
+/// `access_count` counts `context_get` calls only -- search does not bump it.
+/// That is the useful signal: a row that keeps surfacing in results but is never
+/// opened is a row whose title looked relevant and whose body was not.
+///
+/// A report, never an eviction. Nothing in this system deletes a memory on a
+/// timer: a memory can be correct, important, and simply never searched for, and
+/// the failure mode of guessing wrong is silent.
+pub async fn stale(pool: &PgPool, scope: &Scope, limit: i64) -> Result<Vec<StaleRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title, kind, pinned, length(body) AS body_chars,
+               access_count, created_at, accessed_at
+        FROM memory_live
+        WHERE client_id = $1 AND namespace = $2
+        ORDER BY access_count ASC, accessed_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("listing stale memories")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| StaleRow {
+            id: r.get("id"),
+            title: r.get("title"),
+            kind: r.get("kind"),
+            pinned: r.get("pinned"),
+            body_chars: r.get("body_chars"),
+            access_count: r.get("access_count"),
+            created_at: r.get("created_at"),
+            accessed_at: r.get("accessed_at"),
+        })
+        .collect())
+}
+
+/// Set or clear `pinned`, which `recent` sorts to the top of the session-start
+/// push list.
+///
+/// Deliberately not an MCP tool. Pinning is a standing decision about what every
+/// future session should be told exists -- it costs a tool schema in every
+/// session's context to expose, and it depends on the model choosing to spend a
+/// call on something it gets no immediate benefit from. That is an operator
+/// decision, so it lives on the CLI.
+pub async fn set_pinned(pool: &PgPool, scope: &Scope, id: i64, pinned: bool) -> Result<bool> {
+    let done = sqlx::query(
+        r#"
+        UPDATE memory SET pinned = $4
+        WHERE id = $1 AND client_id = $2 AND namespace = $3 AND forgotten_at IS NULL
+        "#,
+    )
+    .bind(id)
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .bind(pinned)
+    .execute(pool)
+    .await
+    .context("setting pinned")?;
+
+    Ok(done.rows_affected() > 0)
+}
+
+#[derive(Debug)]
+pub struct HistoryRow {
+    pub id: i64,
+    pub title: String,
+    pub kind: String,
+    pub created_at: DateTime<Utc>,
+    pub forgotten_at: Option<DateTime<Utc>>,
+    pub forget_reason: Option<String>,
+    pub superseded_by: Option<i64>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Everything the read path cannot see: forgotten, superseded, expired.
+///
+/// These rows are never reaped, which only helps if there is a way to look at
+/// them. Without this they are unreachable in practice -- no search touches
+/// them, and recovering one means writing SQL by hand.
+pub async fn history(pool: &PgPool, scope: &Scope, limit: i64) -> Result<Vec<HistoryRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title, kind, created_at, forgotten_at, forget_reason,
+               superseded_by, expires_at
+        FROM memory
+        WHERE client_id = $1 AND namespace = $2
+          AND (forgotten_at IS NOT NULL
+               OR superseded_by IS NOT NULL
+               OR (expires_at IS NOT NULL AND expires_at <= now()))
+        ORDER BY COALESCE(forgotten_at, created_at) DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("listing hidden memories")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| HistoryRow {
+            id: r.get("id"),
+            title: r.get("title"),
+            kind: r.get("kind"),
+            created_at: r.get("created_at"),
+            forgotten_at: r.get("forgotten_at"),
+            forget_reason: r.get("forget_reason"),
+            superseded_by: r.get("superseded_by"),
+            expires_at: r.get("expires_at"),
+        })
+        .collect())
+}
+
+/// What a restore actually changed, so the caller can tell the user whether the
+/// row is visible again or still hidden behind something else.
+#[derive(Debug)]
+pub struct Restored {
+    pub unforgotten: bool,
+    pub detached_from: Option<i64>,
+    /// Set when the row is still invisible after the restore.
+    pub still_hidden_by: Option<i64>,
+    pub still_expired: bool,
+}
+
+/// Undo a forget, and optionally detach the row from whatever superseded it.
+///
+/// Un-forgetting is not enough on its own: a row can be both forgotten and
+/// superseded, and clearing only `forgotten_at` leaves it exactly as invisible
+/// as before. Detaching is opt-in because it is the more consequential half --
+/// it puts a memory and its correction back in search together, which is
+/// occasionally what you want and usually not.
+pub async fn restore(pool: &PgPool, scope: &Scope, id: i64, detach: bool) -> Result<Option<Restored>> {
+    let mut tx = pool.begin().await?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT forgotten_at, superseded_by, expires_at FROM memory
+        WHERE id = $1 AND client_id = $2 AND namespace = $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(id)
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("looking up the row to restore")?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let was_forgotten: Option<DateTime<Utc>> = row.get("forgotten_at");
+    let superseded_by: Option<i64> = row.get("superseded_by");
+    let expires_at: Option<DateTime<Utc>> = row.get("expires_at");
+
+    if was_forgotten.is_some() {
+        sqlx::query("UPDATE memory SET forgotten_at = NULL, forget_reason = NULL WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .context("clearing the forget")?;
+    }
+
+    let detached_from = if detach { superseded_by } else { None };
+    if detached_from.is_some() {
+        sqlx::query("UPDATE memory SET superseded_by = NULL WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .context("detaching from the superseding row")?;
+    }
+
+    tx.commit().await?;
+
+    Ok(Some(Restored {
+        unforgotten: was_forgotten.is_some(),
+        detached_from,
+        still_hidden_by: if detach { None } else { superseded_by },
+        still_expired: expires_at.is_some_and(|e| e <= Utc::now()),
+    }))
+}
+
 /// The kind `--ingest` writes. Held apart from the rest of the push list; see
 /// `recent`.
 pub const SESSION_SUMMARY: &str = "session-summary";
