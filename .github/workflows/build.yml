@@ -72,12 +72,20 @@ jobs:
   # Publishing is its own job rather than a step inside the matrix: as a step,
   # both legs race to create the same release, and whichever loses has to
   # append to a release it did not make. Here the binaries are collected once,
-  # after every target has built, so a tag either publishes everything or
+  # after every target has built, so a release either publishes everything or
   # nothing.
+  #
+  # Two ways in. Push a `v*` tag by hand, or merge a version bump to main -- the
+  # version in Cargo.toml is the source of truth and the tag is created here, at
+  # publish time.
+  #
+  # The tag is deliberately NOT pushed by a separate job. A tag pushed with
+  # GITHUB_TOKEN does not trigger workflows, so that design produces tags that
+  # never build and releases that never appear.
   release:
     name: release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # Only this job writes anything; the build job keeps the default read-only
     # token.
@@ -85,12 +93,55 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v7
+
+      # Every push to main lands here, and almost none of them are releases.
+      # An existing tag for the current version is what says "already shipped",
+      # so ordinary commits between bumps publish nothing.
+      - name: Decide whether this commit ships
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "ship=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The [package] version, not a dependency's: -m1 stops at the first
+          # `version =`, which sits above every other table in Cargo.toml.
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [[ -z "$version" ]]; then
+            echo "could not read a version from Cargo.toml" >&2
+            exit 1
+          fi
+          tag="v$version"
+
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "ship=false" >> "$GITHUB_OUTPUT"
+            echo "$tag already exists -- bump the version in Cargo.toml to release"
+          else
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "ship=true" >> "$GITHUB_OUTPUT"
+            echo "releasing $tag"
+          fi
+
       - uses: actions/download-artifact@v8
+        if: steps.gate.outputs.ship == 'true'
         with:
           path: dist
           merge-multiple: true
 
+      # Creates the tag on this commit when it does not exist yet, so the tag
+      # can never point at a commit whose binaries were not the ones published.
       - uses: softprops/action-gh-release@v3
+        if: steps.gate.outputs.ship == 'true'
         with:
+          tag_name: ${{ steps.gate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
           files: dist/*
           fail_on_unmatched_files: true
