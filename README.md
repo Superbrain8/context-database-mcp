@@ -330,15 +330,28 @@ the chunker and transcript parsing only — everything else is verified by hand 
 stack.
 
 Ordinary builds only upload the binaries as run artifacts, which expire. Binaries reach the
-**Releases** page only on a tag:
+**Releases** page on a release, and `version` in `Cargo.toml` is what defines one:
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
+```toml
+version = "0.2.0"   # bump, merge to main -> tagged v0.2.0 and published
 ```
 
-Assets are named `context-database-mcp-<target-triple>` (`.exe` on Windows), and the publish step is
-a separate job that waits for every target, so a tag publishes all binaries or none.
+Every push to main checks whether a tag for the current version already exists. If it does, nothing
+is published — so the commits between bumps cost nothing. If it does not, the tag is created on that
+commit and the release goes out with generated notes. Tagging by hand still works and takes the same
+path:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The tag is created by the publishing job rather than pushed by an earlier one. A tag pushed with
+`GITHUB_TOKEN` does not trigger workflows, so the tidier-looking design produces tags that never
+build and releases that never appear.
+
+Assets are named `context-database-mcp-<target-triple>` (`.exe` on Windows), and publishing is a
+separate job that waits for every target, so a release ships all binaries or none.
 
 ## License
 
