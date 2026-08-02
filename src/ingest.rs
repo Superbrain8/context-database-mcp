@@ -155,9 +155,13 @@ async fn store(
         ],
         chunks,
         embedder.model(),
-        None,
+        // A compaction summary supersedes nothing: the previous session's
+        // summary is a record of a different session, not a worse version of
+        // this one.
+        &[],
     )
-    .await?;
+    .await?
+    .id;
 
     tracing::info!(
         namespace = %scope.namespace,

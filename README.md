@@ -78,7 +78,14 @@ Closer to how human memory behaves, and it keeps an audit trail:
 
 - **correct** something → `context_save` with `supersedes`. The new row is written, the old one gets
   `superseded_by` set and disappears from search. Both stay on disk.
+- **merge** several overlapping memories → the same `supersedes`, given a list of ids. One save
+  retires the whole group, so the corpus is never left half-merged. See
+  [`--consolidate`](#8-maintenance-consolidate).
 - **drop** something → `context_forget`. Soft delete via `forgotten_at`; recoverable by hand.
+
+A save reports which ids it actually retired. An id belonging to another project, or one that was
+already superseded, is left alone and named in the reply — a merge that silently leaves one of its
+originals in search would look like it worked.
 
 The only in-place update the system performs is the access-stats bump in `context_get`.
 
@@ -318,6 +325,45 @@ search together, which is occasionally what you want and usually not.
 `--pin` and `--restore` are scoped like every other write — same `client_id`, same namespace. A row
 in another project is deliberately unreachable.
 
+### 8. Maintenance: `--consolidate`
+
+An append-only store accumulates near-duplicates: the same constraint learned twice, a decision
+recorded when it was made and again when it was questioned, four session summaries covering one
+week. None of them is wrong, and together they push the real answer down the ranking behind three
+paraphrases of itself.
+
+```bash
+$BIN --consolidate                      # clusters within 0.22 cosine, 10 shown
+$BIN --consolidate 25 --threshold 0.26  # wider, more clusters
+```
+
+```
+1 cluster(s) of overlapping memories in Context_Database_MCP (chunks within 0.22 cosine)
+
+cluster 1 -- 3 memories, 46209 chars, closest pair 0.13
+  [id=48] (session-summary) session summary 2026-08-01 18:41 | 17839 chars | 2026-08-01
+  [id=51] (session-summary) session summary 2026-08-01 19:46 | 14103 chars | 2026-08-01
+  [id=56] (session-summary) session summary 2026-08-02 07:29 | 14267 chars | 2026-08-02
+  merge: read these with context_get, then context_save the merged text with supersedes=[48, 51, 56]
+```
+
+**It reports; it does not merge**, for the same reason `--stale` does not delete — and for one more:
+nothing in this stack can write the merged text. The embedding server turns text into vectors and
+cannot produce a sentence. The only thing here that can summarise is the model reading the report,
+which is why the output ends in the exact tool call to make.
+
+Memories are compared **chunk to chunk, taking the minimum**, not as whole documents. A long note
+that repeats one paragraph of another averages out to "unrelated", and that repeated paragraph is
+exactly what is worth merging.
+
+Clusters are transitive: if A overlaps B and B overlaps C, all three are one decision even when A and
+C are far apart. That is how a topic actually accretes — but it is also how a slightly loose cutoff
+swallows a whole subject area. Measured on this project's own corpus, the collapse is steep: **0.22
+groups 3 memories, 0.26 groups 7, 0.28 groups 10, 0.35 groups 13 into one cluster.** Past roughly
+0.25 the chaining stops finding duplicates and starts finding the topic, so the default is 0.22 and
+any cluster of six or more is printed with a warning. A missed cluster costs nothing; a bad merge
+destroys the distinction between a rule and its exception, which look identical to a distance metric.
+
 ## Operational notes
 
 - **stdout is the MCP transport.** All logging goes to stderr. A stray `println!` corrupts the
@@ -336,6 +382,12 @@ missing-id path, and cross-project reads with narrow writes across three concurr
 processes. `cargo test` covers the chunker, including multi-byte input that byte-offset slicing
 would panic on.
 
+Consolidation was verified the same way. `--consolidate` was calibrated against the live 45-memory
+corpus at five cutoffs, and the supersede bookkeeping has a database-backed test — ignored in CI,
+which reaches no Postgres, and run by hand with `cargo test -- --ignored`. It asserts that a merge
+retires exactly the rows it names, leaves alone an id from another project and one that was already
+superseded, and that every retired row is still readable by id.
+
 Retrieval behaves as intended on both halves of the hybrid: a paraphrase query with no shared
 keywords is answered by the dense ranker alone, and an exact identifier (`ivfflat`) ranks first in
 both rankers. Chunking was verified against a 4,000-character document with one specific instruction
@@ -344,8 +396,12 @@ returned the containing chunk as the snippet.
 
 ## Not done yet
 
-- Nothing ages out or gets consolidated. `--stale` surfaces the candidates, but forgetting is always
-  a human call, and there is no summarisation of related memories into one.
+- Nothing ages out on its own. `--stale` and `--consolidate` surface the candidates and a save or a
+  forget is always a deliberate call — no timer evicts, and no merge happens without the model
+  writing the merged text.
+- `--consolidate` compares every live chunk against every other one. That is a few tens of thousands
+  of comparisons here and fine; `<=>` between two table columns cannot use the HNSW index, so it is
+  the first thing that needs rethinking at tens of thousands of chunks.
 - Chunk boundaries are character-based, not token-based, so a chunk can land slightly over or under
   what the model would consider a natural passage.
 - Chunk boundaries are fixed at save time; `--reindex` carries a chunker fix backwards, but it has to
