@@ -390,6 +390,28 @@ impl rmcp::ServerHandler for ContextDb {
         );
         info
     }
+
+    /// Only the revisions this server actually speaks.
+    ///
+    /// rmcp 3.1 defaults to `KNOWN_VERSIONS`, which includes `2026-07-28` even
+    /// though its own `LATEST` is `2025-11-25` and it never emits that
+    /// revision's tool-cache fields. Negotiation then agrees to `2026-07-28`
+    /// whenever a client asks for it, the client validates `tools/list` against
+    /// that schema, and the reply is rejected for a missing `ttlMs` and
+    /// `cacheScope`. The server stays connected and serves zero tools, which
+    /// reads from the outside like a broken database.
+    ///
+    /// Agreeing to a version we do not implement is the bug, so the set is
+    /// narrowed to what rmcp really supports. Widen it again only together with
+    /// an rmcp that emits the newer fields.
+    fn supported_protocol_versions(
+        &self,
+    ) -> std::borrow::Cow<'static, [rmcp::model::ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(&[
+            rmcp::model::ProtocolVersion::V_2025_11_25,
+            rmcp::model::ProtocolVersion::V_2025_06_18,
+        ])
+    }
 }
 
 // ----------------------------------------------------------------------- main
