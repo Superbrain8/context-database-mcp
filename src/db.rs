@@ -55,12 +55,24 @@ pub struct Saved {
     pub retired: Vec<i64>,
 }
 
+/// Builds the pool without opening a connection.
+///
+/// Lazy on purpose. An MCP server is spawned once per client and never
+/// respawned: a pool that connects eagerly turns "Postgres was not up yet" into
+/// a process that exits before answering `initialize`, and the client then runs
+/// for its whole lifetime with no memory tools at all. That window is not
+/// hypothetical -- Docker Desktop takes tens of seconds after login to bring the
+/// containers up, and every session started inside it was losing the store for
+/// good while the container went on to run perfectly.
+///
+/// Connecting lazily moves the failure to the first query, where it is one
+/// tool call's error message instead of a dead session, and where the pool
+/// reconnects by itself once the database is listening.
 pub async fn connect(url: &str) -> Result<PgPool> {
     PgPoolOptions::new()
         .max_connections(4)
         .acquire_timeout(std::time::Duration::from_secs(10))
-        .connect(url)
-        .await
+        .connect_lazy(url)
         .with_context(|| format!("connecting to postgres at {url}"))
 }
 
