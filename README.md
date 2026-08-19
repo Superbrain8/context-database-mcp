@@ -131,6 +131,13 @@ docker compose up -d
 First start downloads bge-m3 (~2.2 GB) into the `hfcache` volume. Watch it with
 `docker logs -f ctxdb-embed`; the server is ready when `/health` returns 200.
 
+You do not have to start the stack before your editor. The MCP server builds its connection pool
+lazily, so it completes the MCP handshake and shows its tools even when Postgres is not up yet.
+
+A tool call made during that time returns an error, and the pool connects by itself as soon as the
+database listens. This is deliberate. A client starts the server one time only, so a server that
+exits at startup leaves that session with no memory tools until you restart the client.
+
 Idle footprint is ~2.5 GB for the embedder and ~40 MB for Postgres. Almost all of the embedder's
 share is model weights and it is resident whether or not anything is searching — TEI's ONNX CPU
 backend sizes its arena during warmup and never gives it back. That is also why the compose file
