@@ -18,3 +18,4 @@
 
 # Retrieval question sets hold real memory ids and titles from real projects.
 /eval/sets/
+__pycache__/
