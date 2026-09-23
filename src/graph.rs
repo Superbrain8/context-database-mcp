@@ -305,6 +305,57 @@ impl Graph {
     }
 }
 
+/// Score of a memory reached by an edge, as a fraction of the score of the
+/// search hit that reached it. It only orders neighbours among themselves and
+/// shows the caller that the memory came second-hand: neighbours never outrank
+/// a direct hit (see `context_search`), so its value does not change results.
+pub const EXPAND_DECAY: f64 = 0.5;
+
+/// A memory reached from a search hit by one edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expanded {
+    pub id: i64,
+    pub score: f64,
+    /// The hit it was reached from: the one that gave it its best score.
+    pub via: i64,
+    pub link: Link,
+}
+
+/// One-hop neighbours of search hits, for `context_search` with `expand`.
+///
+/// A neighbour scores `decay` times the score of the hit that reached it, the
+/// best such hit when several do. Hits themselves are never returned: they are
+/// already in the result on their own merit. Order is by score, then id, so
+/// the same search gives the same list.
+pub fn expand(graph: &Graph, hits: &[(i64, f64)], decay: f64) -> Vec<Expanded> {
+    let is_hit: HashSet<i64> = hits.iter().map(|(id, _)| *id).collect();
+    let mut best: HashMap<i64, Expanded> = HashMap::new();
+
+    for &(hit, score) in hits {
+        for link in graph.links(hit) {
+            if is_hit.contains(&link.other) {
+                continue;
+            }
+            let candidate = Expanded {
+                id: link.other,
+                score: score * decay,
+                via: hit,
+                link: link.clone(),
+            };
+            match best.get(&link.other) {
+                Some(e) if e.score >= candidate.score => {}
+                _ => {
+                    best.insert(link.other, candidate);
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<Expanded> = best.into_values().collect();
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +555,37 @@ mod tests {
         let r = g.related(1000, 1, None);
         assert_eq!(r.hits.len(), MAX_RESULTS);
         assert!(r.truncated);
+    }
+
+    #[test]
+    fn expansion_scores_a_neighbour_from_its_best_hit() {
+        // 3 is a neighbour of both hits; the stronger hit (1) sets its score.
+        let g = graph(
+            vec![
+                edge(1, 1, 3, Rel::RelatesTo),
+                edge(2, 2, 3, Rel::DependsOn),
+                edge(3, 2, 4, Rel::Refines),
+            ],
+            &[],
+            &[1, 2, 3, 4],
+        );
+        let out = expand(&g, &[(1, 0.030), (2, 0.020)], 0.5);
+        let got: Vec<(i64, i64)> = out.iter().map(|e| (e.id, e.via)).collect();
+        assert_eq!(got, vec![(3, 1), (4, 2)]);
+        assert!((out[0].score - 0.015).abs() < 1e-12);
+        assert!((out[1].score - 0.010).abs() < 1e-12);
+    }
+
+    #[test]
+    fn expansion_never_repeats_a_hit() {
+        let g = graph(vec![edge(1, 1, 2, Rel::RelatesTo)], &[], &[1, 2]);
+        assert!(expand(&g, &[(1, 0.03), (2, 0.02)], 0.9).is_empty());
+    }
+
+    #[test]
+    fn expansion_skips_hidden_neighbours() {
+        let g = graph(vec![edge(1, 1, 2, Rel::RelatesTo)], &[], &[1]);
+        assert!(expand(&g, &[(1, 0.03)], 0.9).is_empty());
     }
 
     #[test]

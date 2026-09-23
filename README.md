@@ -152,7 +152,7 @@ A forgotten memory thus never becomes a path to its neighbors.
 | Tool | Purpose |
 |---|---|
 | `context_save` | Store a durable fact, decision, root cause or file summary. Returns an id. |
-| `context_search` | Hybrid search. Returns ranked **snippets** (300 chars) + ids. `cross_project: true` widens beyond the current project. |
+| `context_search` | Hybrid search. Returns ranked **snippets** (300 chars) + ids. `cross_project: true` widens beyond the current project. `expand: true` fills empty result slots with memories linked to the results. |
 | `context_get` | Full body of one memory, by id, and its direct edges. |
 | `context_forget` | Soft-delete a memory (`id`), or an edge (`edge_id`). |
 | `context_link` | Make one typed edge between two existing memories. `context_save` can also make edges with `links`. |
@@ -478,6 +478,49 @@ Each pair up to 0.36 in a manual check had a real shared topic. The cutoff thus 
 many pairs you must read, not the precision. Run `--edges` after a merge with `--consolidate`,
 because a merge makes the duplicate edges and the self-edges.
 
+### 10. Maintenance: `--link`
+
+```bash
+CTXDB_NAMESPACE=<project> context-database-mcp --link SRC DST --rel depends_on [--note "..."]
+```
+
+This command makes one edge, with the same write rules as `context_link`. Use it to link memories
+in a project that is not the project of your session. `context_link` needs one end in the project
+of the session, as all writes from a session do. `--save` is the same path for memories.
+
+### 11. Search that follows edges, and its measurement
+
+`context_search` with `expand: true` adds memories that are one edge away from the results. A
+memory found this way shows `via edge=N: ...` and a lower score. The result keeps its `limit`.
+
+A neighbor never takes the place of a direct hit. It only fills a slot that the distance cutoff
+left empty. `eval/run.py` measured three policies on 20 real questions in one project with 58
+edges (2026-09-23, `limit` 8):
+
+| Policy | Recall | MRR | All relevant found | Questions made worse |
+|---|---|---|---|---|
+| No expansion | 0.896 | 0.892 | 14 | — |
+| Sort neighbors in with the hits by score | 0.908 | 0.917 | 15 | 4 |
+| **Fill empty slots only (default)** | **0.912** | 0.892 | **15** | **0** |
+| Also take the last 1 to 4 slots | 0.812–0.883 | 0.892 | 12–14 | 3–7 |
+
+Fusion scores are flat. Thus a neighbor of the first hit outranks most direct hits, and the direct
+hits at the bottom of the list are often relevant. Each policy that let a neighbor push out a direct
+hit lost more than it gained. `CTXDB_EXPAND_SLOTS` sets how many of the last slots a neighbor can
+take (default 0). It exists only for more measurement.
+
+`expand` is off by default. The gain is small. Also, the question set and the edges came from one
+person in one session, which can bias the result. Measure a second project before you make it the
+default.
+
+To measure, write a question set (see the header of `eval/run.py`) into `eval/sets/`, and run:
+
+```bash
+python eval/run.py eval/sets/<project>.json --slots 0 --slots 2
+```
+
+Git ignores `eval/sets/`, because a set holds memory ids and titles from real projects.
+
 ## Operational notes
 
 - **stdout is the MCP transport.** All logging goes to stderr. A stray `println!` corrupts the
@@ -533,8 +576,9 @@ All six tools were also used in a real stdio session against the live stack.
 - Nothing removes edges automatically. `--edges` lists the stored edges that the graph does not
   show, and a person or the model forgets them. The read path hides these edges, so the graph is
   correct without a clean-up.
-- Search does not follow edges yet. A planned `expand` flag on `context_search` adds the one-hop
-  neighbors of the top results.
+- `expand` is measured on one project only, so it is off by default. It orders neighbors by the
+  score of the hit that reached them. Thus the neighbors of the first hit take the free slots
+  before the neighbors of a lower hit.
 - Token counts come from the server, so chunking needs the embedder reachable — which it always is on
   a write path. An embedding server with no `/tokenize` route falls back to the old character-based
   chunker and says so in the log.

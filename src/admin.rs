@@ -286,3 +286,30 @@ pub async fn save(
     }
     Ok(())
 }
+
+/// `--link SRC DST --rel R [--note "..."]`: one edge, from the command line.
+///
+/// The `--save` argument again: `context_link` needs one end in the namespace
+/// the session resolved at launch, so an edge inside another project can only
+/// be written from a shell pointed at it. The write rules are the tool's own
+/// (`db::link`); a refusal is an error here because a person is reading it.
+pub async fn link(
+    database_url: &str,
+    scope: &Scope,
+    src: i64,
+    dst: i64,
+    rel: crate::graph::Rel,
+    note: Option<&str>,
+) -> Result<()> {
+    let pool = db::connect(database_url).await?;
+    match db::link(&pool, scope, src, dst, rel, note).await? {
+        db::LinkOutcome::Created { edge_id, src, dst } => {
+            println!("linked edge={edge_id}: {src} {} {dst}", rel.as_str())
+        }
+        db::LinkOutcome::Exists { edge_id, src, dst } => {
+            println!("already linked edge={edge_id}: {src} {} {dst}", rel.as_str())
+        }
+        db::LinkOutcome::Refused(why) => anyhow::bail!("refused: {why}"),
+    }
+    Ok(())
+}

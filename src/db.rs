@@ -482,7 +482,9 @@ pub struct Node {
     pub id: i64,
     pub title: String,
     pub kind: String,
+    pub tags: Vec<String>,
     pub namespace: String,
+    pub created_at: DateTime<Utc>,
     pub snippet: String,
 }
 
@@ -494,7 +496,7 @@ pub async fn nodes(
 ) -> Result<std::collections::HashMap<i64, Node>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, title, kind, namespace, left(body, 300) AS snippet
+        SELECT id, title, kind, tags, namespace, created_at, left(body, 300) AS snippet
         FROM memory_live
         WHERE client_id = $1 AND id = ANY($2)
         "#,
@@ -512,7 +514,9 @@ pub async fn nodes(
                 id: r.get("id"),
                 title: r.get("title"),
                 kind: r.get("kind"),
+                tags: r.get("tags"),
                 namespace: r.get("namespace"),
+                created_at: r.get("created_at"),
                 snippet: r.get("snippet"),
             };
             (n.id, n)

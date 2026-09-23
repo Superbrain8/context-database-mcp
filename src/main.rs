@@ -41,6 +41,10 @@ struct ContextDb {
     /// project's own notes: a paraphrase of a stored note sits near 0.33, an
     /// unrelated note near 0.66. 0.55 keeps paraphrases and drops strangers.
     max_distance: f64,
+    /// Bottom slots of a full result that neighbours may take; slots the
+    /// distance cutoff left empty are theirs as well. Measured at 0: any
+    /// neighbour that pushed out a direct hit cost more recall than it gained.
+    expand_slots: usize,
 }
 
 // ---------------------------------------------------------------- tool params
@@ -151,6 +155,10 @@ struct SearchParams {
     /// this error before?". Results from elsewhere are marked with their origin.
     #[serde(default)]
     cross_project: Option<bool>,
+    /// Fill result slots the search left empty with memories linked by an edge
+    /// to the results. Marked "via edge" in the output.
+    #[serde(default)]
+    expand: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -397,10 +405,40 @@ impl ContextDb {
             return "no matching memories".to_string();
         }
 
+        // Neighbours by edge go after every direct hit, never between them, and
+        // the result keeps its limit: `expand` changes what is shown, never how
+        // much. Interleaving by score was measured and rejected -- fusion
+        // scores are flat, so any neighbour of the top hit outranked most
+        // direct hits and pushed relevant ones out (see eval/run.py).
+        let mut via: std::collections::HashMap<i64, (i64, graph::Link)> = Default::default();
+        let mut hits = hits;
+        if p.expand.unwrap_or(false) {
+            let cross = p.cross_project.unwrap_or(false);
+            match self.expanded(&hits, limit, p.kind.as_deref(), &tags, cross).await {
+                Ok(extra) => {
+                    let limit = limit as usize;
+                    let room = self.expand_slots.max(limit.saturating_sub(hits.len()));
+                    let take = extra.len().min(room);
+                    hits.truncate(limit - take);
+                    for (hit, from, link) in extra.into_iter().take(take) {
+                        via.insert(hit.id, (from, link));
+                        hits.push(hit);
+                    }
+                }
+                // The direct hits are still good; losing the expansion must
+                // not cost the search.
+                Err(e) => tracing::warn!("search: expansion failed: {e:#}"),
+            }
+        }
+
         // Snippets only. Returning full bodies here would re-inflate the context
         // window and defeat the point of offloading in the first place.
         let mut out = String::new();
         for h in hits {
+            let edge = match via.get(&h.id) {
+                Some((from, link)) => format!(" | via {}", edge_label(link, *from)),
+                None => String::new(),
+            };
             // Only label the origin when it is not the current project, so the
             // common case stays quiet and a foreign memory stands out.
             let origin = if h.namespace == self.scope.namespace {
@@ -409,7 +447,7 @@ impl ContextDb {
                 format!(" | from project {}", h.namespace)
             };
             out.push_str(&format!(
-                "[id={}] ({}) {} | tags={:?} | {}{} | score={:.4}\n  {}\n",
+                "[id={}] ({}) {} | tags={:?} | {}{} | score={:.4}{}\n  {}\n",
                 h.id,
                 h.kind,
                 h.title,
@@ -417,6 +455,7 @@ impl ContextDb {
                 h.created_at.format("%Y-%m-%d"),
                 origin,
                 h.score,
+                edge,
                 h.snippet.replace('\n', " "),
             ));
         }
@@ -506,6 +545,55 @@ impl ContextDb {
             }
             _ => "ERROR: give exactly one of `id` or `edge_id`".to_string(),
         }
+    }
+}
+
+impl ContextDb {
+    /// One-hop neighbours of `hits` as search hits, each with the hit it was
+    /// reached from and the edge. Filtered like the search itself: project,
+    /// kind and tags.
+    async fn expanded(
+        &self,
+        hits: &[db::SearchHit],
+        limit: i64,
+        kind: Option<&str>,
+        tags: &[String],
+        cross_project: bool,
+    ) -> anyhow::Result<Vec<(db::SearchHit, i64, graph::Link)>> {
+        let graph = db::load_graph(&self.pool, &self.scope.client_id).await?;
+        let seeds: Vec<(i64, f64)> = hits.iter().map(|h| (h.id, h.score)).collect();
+        let found = graph::expand(&graph, &seeds, graph::EXPAND_DECAY);
+
+        let ids: Vec<i64> = found.iter().map(|e| e.id).collect();
+        let nodes = db::nodes(&self.pool, &self.scope.client_id, &ids).await?;
+
+        Ok(found
+            .into_iter()
+            .filter_map(|e| {
+                let n = nodes.get(&e.id)?;
+                let allowed = (cross_project || n.namespace == self.scope.namespace)
+                    && kind.is_none_or(|k| n.kind == k)
+                    && tags.iter().all(|t| n.tags.contains(t));
+                allowed.then(|| {
+                    (
+                        db::SearchHit {
+                            id: n.id,
+                            title: n.title.clone(),
+                            snippet: n.snippet.clone(),
+                            kind: n.kind.clone(),
+                            tags: n.tags.clone(),
+                            namespace: n.namespace.clone(),
+                            created_at: n.created_at,
+                            score: e.score,
+                        },
+                        e.via,
+                        e.link,
+                    )
+                })
+            })
+            // More than `limit` can never survive the cut.
+            .take(limit as usize)
+            .collect())
     }
 }
 
@@ -972,6 +1060,25 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    // `--link SRC DST --rel R [--note "..."]`: the operator path to an edge in
+    // another project, like `--save`. See admin::link.
+    if let Some(pos) = args.iter().position(|a| a == "--link") {
+        let id_at = |i: usize| -> anyhow::Result<i64> {
+            let raw = args
+                .get(pos + i)
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| anyhow::anyhow!("--link needs two memory ids: --link SRC DST --rel R"))?;
+            raw.parse()
+                .map_err(|_| anyhow::anyhow!("--link takes memory ids, got {raw:?}"))
+        };
+        let (src, dst) = (id_at(1)?, id_at(2)?);
+        let rel_raw = arg_after(&args, "--rel").unwrap_or("relates_to");
+        let rel = graph::Rel::parse(rel_raw).ok_or_else(|| {
+            anyhow::anyhow!("--rel {rel_raw:?}: use relates_to, depends_on, contradicts or refines")
+        })?;
+        return admin::link(&database_url, &scope, src, dst, rel, arg_after(&args, "--note")).await;
+    }
+
     tracing::info!(
         client_id = %scope.client_id,
         namespace = %scope.namespace,
@@ -990,11 +1097,18 @@ async fn main() -> anyhow::Result<()> {
         .parse::<f64>()
         .unwrap_or(0.55);
 
+    // Tuned with eval/run.py; see the README.
+    let expand_slots = env_or("CTXDB_EXPAND_SLOTS", "0")
+        .parse::<usize>()
+        .unwrap_or(0)
+        .min(50);
+
     let server = ContextDb {
         pool,
         embedder: Arc::new(embedder),
         scope: Arc::new(scope),
         max_distance,
+        expand_slots,
     };
 
     let service = server.serve(stdio()).await?;
