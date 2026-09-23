@@ -13,6 +13,7 @@ mod reindex;
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use rmcp::{
     handler::server::wrapper::Parameters, schemars, tool, tool_handler, tool_router,
     transport::stdio, ServiceExt,
@@ -554,6 +555,47 @@ fn id_after(args: &[String], flag: &str) -> anyhow::Result<i64> {
         .map_err(|_| anyhow::anyhow!("{flag} takes a memory id, got {raw:?}"))
 }
 
+/// Comma-separated values after `flag`, trimmed, empty entries dropped.
+fn list_after(args: &[String], flag: &str) -> Vec<String> {
+    arg_after(args, flag)
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Comma-separated memory ids after `flag`, for `--save --supersedes 1,2,3`.
+fn ids_after(args: &[String], flag: &str) -> anyhow::Result<Vec<i64>> {
+    let Some(raw) = arg_after(args, flag) else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("{flag} takes comma-separated ids, got {s:?}"))
+        })
+        .collect()
+}
+
+/// `--body-file <path>` reads the file; `--body "..."` is the inline form.
+/// A file is what a real merge actually needs -- the merged text is written by
+/// the model reading the `--consolidate` report, not typed on a command line.
+fn body_after(args: &[String]) -> anyhow::Result<String> {
+    if let Some(path) = arg_after(args, "--body-file") {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("reading --body-file {path}"));
+    }
+    arg_after(args, "--body")
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("--save needs --body \"...\" or --body-file <path>"))
+}
+
 fn limit_after(args: &[String], flag: &str, default: i64) -> i64 {
     arg_after(args, flag)
         .and_then(|n| n.parse::<i64>().ok())
@@ -664,6 +706,33 @@ async fn main() -> anyhow::Result<()> {
     if args.iter().any(|a| a == "--restore") {
         let detach = args.iter().any(|a| a == "--detach");
         return admin::restore(&database_url, &scope, id_after(&args, "--restore")?, detach).await;
+    }
+    // `--save --title T --body "..."|--body-file F [--kind K] [--tags a,b]
+    // [--supersedes 1,2,3]`: the one write path that can target a namespace
+    // other than wherever an interactive session happens to be running -- by
+    // running this from a shell with CTXDB_NAMESPACE (or cwd) pointed at the
+    // target project. Not reachable through the MCP tool surface; see
+    // admin::save for why that boundary matters.
+    if args.iter().any(|a| a == "--save") {
+        let title = arg_after(&args, "--title")
+            .ok_or_else(|| anyhow::anyhow!("--save needs --title \"...\""))?
+            .to_string();
+        let body = body_after(&args)?;
+        let kind = arg_after(&args, "--kind").unwrap_or("note").to_string();
+        let tags = list_after(&args, "--tags");
+        let supersedes = ids_after(&args, "--supersedes")?;
+        return admin::save(
+            &database_url,
+            embed_url,
+            embed_model,
+            &scope,
+            title,
+            body,
+            kind,
+            tags,
+            supersedes,
+        )
+        .await;
     }
 
     tracing::info!(

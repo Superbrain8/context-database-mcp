@@ -1,19 +1,22 @@
-//! Operator modes: `--stale`, `--pin`, `--unpin`, `--history`, `--restore`.
+//! Operator modes: `--stale`, `--pin`, `--unpin`, `--history`, `--restore`,
+//! `--save`.
 //!
 //! None of these are MCP tools, and that is the design rather than an omission.
 //! Every tool exposed to the model costs schema tokens in every session's
-//! context whether it is used or not, and these four are decisions a person
-//! makes occasionally, not decisions a model makes mid-conversation. Pinning is
-//! a standing judgement about what future sessions should be told exists;
-//! restoring is an undo for a mistake the model itself made.
+//! context whether it is used or not, and these are decisions a person makes
+//! occasionally, not decisions a model makes mid-conversation. Pinning is a
+//! standing judgement about what future sessions should be told exists;
+//! restoring is an undo for a mistake the model itself made; `--save` writes
+//! into whatever namespace this process resolves to, which is exactly the
+//! power a tool argument must never have (see the crate doc comment).
 //!
 //! Like `--reindex`, these fail loudly. They are run by hand, so an error is
 //! read by someone who can act on it.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 
-use crate::{db, Scope};
+use crate::{db, embed::Embedder, Scope};
 
 /// `--stale [N]`: the least-read live memories, oldest access first.
 ///
@@ -172,6 +175,112 @@ pub async fn restore(database_url: &str, scope: &Scope, id: i64, detach: bool) -
     }
     if r.still_expired {
         println!("  still hidden: expires_at is in the past.");
+    }
+    Ok(())
+}
+
+/// `--save --title T --body "..."|--body-file F [--kind K] [--tags a,b] \
+/// [--supersedes 1,2,3]`: write a memory in this process's own namespace.
+///
+/// Exists for one reason: `context_save` (the MCP tool) can only ever write to
+/// the namespace this process resolved at launch, on purpose -- a model must
+/// never be able to name another project's namespace in a tool argument. That
+/// leaves no way to merge memories that live in a project *other* than the one
+/// the current session is running in. This is that path: point `CTXDB_NAMESPACE`
+/// (or cwd) at the target project and run it by hand, same trust boundary as
+/// every other operator mode here, just exercised by a person instead of a
+/// model mid-conversation.
+#[allow(clippy::too_many_arguments)]
+pub async fn save(
+    database_url: &str,
+    embed_url: String,
+    embed_model: String,
+    scope: &Scope,
+    title: String,
+    body: String,
+    kind: String,
+    tags: Vec<String>,
+    supersedes: Vec<i64>,
+) -> Result<()> {
+    let pool = db::connect(database_url).await?;
+    let embedder = Embedder::new(embed_url, embed_model);
+    embedder
+        .ping()
+        .await
+        .context("embedding server unreachable")?;
+
+    let (pieces, inputs) = embedder
+        .chunk_inputs(&title, &body)
+        .await
+        .context("chunking failed")?;
+    anyhow::ensure!(!pieces.is_empty(), "body is empty");
+
+    let embeddings = embedder.embed(&inputs).await.context("embedding failed")?;
+    anyhow::ensure!(
+        embeddings.len() == pieces.len(),
+        "embedding server returned {} vectors for {} chunks",
+        embeddings.len(),
+        pieces.len()
+    );
+    let chunks: Vec<(String, Vec<f32>)> = pieces.into_iter().zip(embeddings).collect();
+    let chunk_count = chunks.len();
+
+    let saved = db::save(
+        &pool,
+        scope,
+        &title,
+        &body,
+        &kind,
+        &tags,
+        chunks,
+        embedder.model(),
+        &supersedes,
+    )
+    .await
+    .context("save failed")?;
+
+    let split = if chunk_count > 1 {
+        format!(" in {chunk_count} chunks")
+    } else {
+        String::new()
+    };
+    if supersedes.is_empty() {
+        println!("saved id={} in namespace {}{split}", saved.id, scope.namespace);
+        return Ok(());
+    }
+
+    // Same asked-vs-retired distinction as the MCP tool: an id that was not
+    // retired means it belongs to another namespace or was already superseded,
+    // and swallowing that silently is how a merge looks done while an original
+    // is still sitting in search.
+    let missed: Vec<String> = supersedes
+        .iter()
+        .filter(|id| !saved.retired.contains(id))
+        .map(i64::to_string)
+        .collect();
+    if saved.retired.is_empty() {
+        println!(
+            "saved id={} in namespace {}{split} (nothing was retired)",
+            saved.id, scope.namespace
+        );
+    } else {
+        let retired = saved
+            .retired
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "saved id={} in namespace {}{split} (retired id={retired})",
+            saved.id, scope.namespace
+        );
+    }
+    if !missed.is_empty() {
+        println!(
+            "  id={} left alone: not in namespace {}, or already superseded",
+            missed.join(", "),
+            scope.namespace
+        );
     }
     Ok(())
 }

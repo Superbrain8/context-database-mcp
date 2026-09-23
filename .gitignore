@@ -12,3 +12,6 @@
 # a permission prompt writes .claude/settings.json back anyway, and a committed
 # copy would apply one machine's answers to everyone who clones.
 /.claude/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
