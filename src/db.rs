@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
+use crate::graph::{self, Edge, Graph, Rel};
 use crate::Scope;
 
 /// Reciprocal-rank-fusion constant. 60 is the value from the original RRF paper
@@ -53,6 +54,36 @@ pub struct MemoryRow {
 pub struct Saved {
     pub id: i64,
     pub retired: Vec<i64>,
+    /// One outcome per requested link, in request order.
+    pub links: Vec<LinkOutcome>,
+}
+
+/// One edge a save should create, with the new memory as src.
+#[derive(Debug, Clone)]
+pub struct LinkRequest {
+    pub id: i64,
+    pub rel: Rel,
+    pub note: Option<String>,
+}
+
+/// What became of one requested edge.
+///
+/// A refused edge is reported, never swallowed -- the same rule as a supersede
+/// that retired nothing. `src`/`dst` are the stored ids, which differ from the
+/// requested ones when an end was superseded and resolved to its live head.
+#[derive(Debug, PartialEq)]
+pub enum LinkOutcome {
+    Created { edge_id: i64, src: i64, dst: i64 },
+    Exists { edge_id: i64, src: i64, dst: i64 },
+    Refused(String),
+}
+
+/// Where a memory id leads when an edge is written against it.
+#[derive(Debug, PartialEq)]
+enum Head {
+    Missing,
+    Hidden(i64),
+    Live { id: i64, namespace: String },
 }
 
 /// Builds the pool without opening a connection.
@@ -94,6 +125,7 @@ pub async fn save(
     chunks: Vec<(String, Vec<f32>)>,
     embed_model: &str,
     supersedes: &[i64],
+    links: &[LinkRequest],
 ) -> Result<Saved> {
     let mut tx = pool.begin().await?;
 
@@ -166,8 +198,301 @@ pub async fn save(
         retired.sort_unstable();
     }
 
+    // After the supersede, so a link to a row this same save retires resolves
+    // to the new memory itself and is refused as a self-edge.
+    let mut outcomes = Vec::with_capacity(links.len());
+    for l in links {
+        outcomes.push(insert_edge(&mut tx, scope, id, l.id, l.rel, l.note.as_deref()).await?);
+    }
+
     tx.commit().await?;
-    Ok(Saved { id, retired })
+    Ok(Saved {
+        id,
+        retired,
+        links: outcomes,
+    })
+}
+
+/// Follow `superseded_by` from `id` to the head of its chain, inside the
+/// caller's transaction so a supersede earlier in the same save is seen.
+///
+/// Scoped to `client_id` only: an edge may cross namespaces (decision D2), never
+/// clients.
+async fn resolve_head(conn: &mut sqlx::PgConnection, client_id: &str, id: i64) -> Result<Head> {
+    let mut cur = id;
+    for _ in 0..graph::MAX_CHAIN {
+        let row = sqlx::query(
+            r#"
+            SELECT superseded_by, namespace,
+                   forgotten_at IS NULL AND (expires_at IS NULL OR expires_at > now()) AS visible
+            FROM memory WHERE id = $1 AND client_id = $2
+            "#,
+        )
+        .bind(cur)
+        .bind(client_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .context("resolving an edge end")?;
+
+        let Some(r) = row else {
+            return Ok(Head::Missing);
+        };
+        match r.get::<Option<i64>, _>("superseded_by") {
+            Some(next) => cur = next,
+            None if r.get::<bool, _>("visible") => {
+                return Ok(Head::Live {
+                    id: cur,
+                    namespace: r.get("namespace"),
+                })
+            }
+            None => return Ok(Head::Hidden(cur)),
+        }
+    }
+    Ok(Head::Hidden(cur))
+}
+
+/// Write one edge, applying the write rules in order:
+///
+/// - each end resolves to its live head; a missing or hidden end is refused
+/// - an edge from a memory to itself (after resolution) is refused
+/// - at least one end must be in this process's namespace -- reads may cross
+///   projects, but a project never writes a relation between two others
+/// - a symmetric edge is stored smaller id first
+/// - an edge that already exists is reported, not duplicated
+async fn insert_edge(
+    conn: &mut sqlx::PgConnection,
+    scope: &Scope,
+    src: i64,
+    dst: i64,
+    rel: Rel,
+    note: Option<&str>,
+) -> Result<LinkOutcome> {
+    let mut ends = Vec::with_capacity(2);
+    for id in [src, dst] {
+        match resolve_head(conn, &scope.client_id, id).await? {
+            Head::Missing => {
+                return Ok(LinkOutcome::Refused(format!("no memory with id={id} in this scope")))
+            }
+            Head::Hidden(h) if h == id => {
+                return Ok(LinkOutcome::Refused(format!("id={id} is forgotten or expired")))
+            }
+            Head::Hidden(h) => {
+                return Ok(LinkOutcome::Refused(format!(
+                    "id={id} was superseded by id={h}, which is forgotten or expired"
+                )))
+            }
+            Head::Live { id, namespace } => ends.push((id, namespace)),
+        }
+    }
+    let (s, s_ns) = &ends[0];
+    let (d, d_ns) = &ends[1];
+
+    if s == d {
+        return Ok(LinkOutcome::Refused(format!(
+            "id={src} and id={dst} resolve to the same memory (id={s})"
+        )));
+    }
+    if *s_ns != scope.namespace && *d_ns != scope.namespace {
+        return Ok(LinkOutcome::Refused(
+            "neither end is in this project; an edge needs at least one".to_string(),
+        ));
+    }
+
+    let (s, d) = rel.stored_order(*s, *d);
+
+    let created = sqlx::query(
+        r#"
+        INSERT INTO memory_edge (client_id, src_id, dst_id, rel, note)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (src_id, dst_id, rel) WHERE forgotten_at IS NULL DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(s)
+    .bind(d)
+    .bind(rel.as_str())
+    .bind(note)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("inserting edge")?;
+
+    if let Some(r) = created {
+        return Ok(LinkOutcome::Created {
+            edge_id: r.get("id"),
+            src: s,
+            dst: d,
+        });
+    }
+
+    let existing: i64 = sqlx::query(
+        r#"
+        SELECT id FROM memory_edge
+        WHERE src_id = $1 AND dst_id = $2 AND rel = $3 AND forgotten_at IS NULL
+        "#,
+    )
+    .bind(s)
+    .bind(d)
+    .bind(rel.as_str())
+    .fetch_one(&mut *conn)
+    .await
+    .context("reading the existing edge")?
+    .get("id");
+
+    Ok(LinkOutcome::Exists {
+        edge_id: existing,
+        src: s,
+        dst: d,
+    })
+}
+
+/// `context_link`: one edge between two existing memories.
+pub async fn link(
+    pool: &PgPool,
+    scope: &Scope,
+    src: i64,
+    dst: i64,
+    rel: Rel,
+    note: Option<&str>,
+) -> Result<LinkOutcome> {
+    let mut tx = pool.begin().await?;
+    let out = insert_edge(&mut tx, scope, src, dst, rel, note).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Soft delete of one edge. Scoped like the edge writes: this client, and at
+/// least one end in this process's namespace.
+pub async fn forget_edge(
+    pool: &PgPool,
+    scope: &Scope,
+    edge_id: i64,
+    reason: Option<&str>,
+) -> Result<bool> {
+    let done = sqlx::query(
+        r#"
+        UPDATE memory_edge e
+        SET forgotten_at = now(), forget_reason = $3
+        WHERE e.id = $1 AND e.client_id = $2 AND e.forgotten_at IS NULL
+          AND EXISTS (
+              SELECT 1 FROM memory m
+              WHERE m.id IN (e.src_id, e.dst_id) AND m.namespace = $4
+          )
+        "#,
+    )
+    .bind(edge_id)
+    .bind(&scope.client_id)
+    .bind(reason)
+    .bind(&scope.namespace)
+    .execute(pool)
+    .await
+    .context("forgetting edge")?;
+
+    Ok(done.rows_affected() > 0)
+}
+
+/// The client's whole graph, every namespace: live edges plus what is needed to
+/// resolve their ends. See graph.rs for why this is loaded rather than walked
+/// in SQL.
+pub async fn load_graph(pool: &PgPool, client_id: &str) -> Result<Graph> {
+    let edge_rows = sqlx::query(
+        r#"
+        SELECT id, src_id, dst_id, rel, note FROM memory_edge
+        WHERE client_id = $1 AND forgotten_at IS NULL
+        "#,
+    )
+    .bind(client_id)
+    .fetch_all(pool)
+    .await
+    .context("loading edges")?;
+
+    let mut edges = Vec::with_capacity(edge_rows.len());
+    for r in edge_rows {
+        let rel: String = r.get("rel");
+        // A type written by a newer build. Skipped, not fatal: one unknown edge
+        // must not take the whole graph down with it.
+        let Some(rel) = Rel::parse(&rel) else {
+            tracing::warn!(edge = r.get::<i64, _>("id"), rel, "skipping edge of unknown type");
+            continue;
+        };
+        edges.push(Edge {
+            id: r.get("id"),
+            src: r.get("src_id"),
+            dst: r.get("dst_id"),
+            rel,
+            note: r.get("note"),
+        });
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, superseded_by,
+               forgotten_at IS NULL AND (expires_at IS NULL OR expires_at > now()) AS visible
+        FROM memory WHERE client_id = $1
+        "#,
+    )
+    .bind(client_id)
+    .fetch_all(pool)
+    .await
+    .context("loading supersede chains")?;
+
+    let mut superseded_by = std::collections::HashMap::new();
+    let mut visible = std::collections::HashSet::new();
+    for r in rows {
+        let id: i64 = r.get("id");
+        if let Some(next) = r.get::<Option<i64>, _>("superseded_by") {
+            superseded_by.insert(id, next);
+        }
+        if r.get::<bool, _>("visible") {
+            visible.insert(id);
+        }
+    }
+
+    Ok(Graph::build(edges, superseded_by, visible))
+}
+
+/// Enough of a memory to list it as a graph neighbour.
+#[derive(Debug)]
+pub struct Node {
+    pub id: i64,
+    pub title: String,
+    pub kind: String,
+    pub namespace: String,
+    pub snippet: String,
+}
+
+/// Live memories by id, client-wide (a neighbour may be in another project).
+pub async fn nodes(
+    pool: &PgPool,
+    client_id: &str,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Node>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title, kind, namespace, left(body, 300) AS snippet
+        FROM memory_live
+        WHERE client_id = $1 AND id = ANY($2)
+        "#,
+    )
+    .bind(client_id)
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+    .context("reading graph neighbours")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let n = Node {
+                id: r.get("id"),
+                title: r.get("title"),
+                kind: r.get("kind"),
+                namespace: r.get("namespace"),
+                snippet: r.get("snippet"),
+            };
+            (n.id, n)
+        })
+        .collect())
 }
 
 /// Hybrid retrieval: dense vector search fused with BM25-ish full-text search.
@@ -939,9 +1264,9 @@ mod tests {
         // embedder has no bearing on it.
         let chunk = || vec![("chunk".to_string(), vec![0.0f32; 1024])];
 
-        let a = save(&pool, &scope, "a", "a", "note", &[], chunk(), "test", &[]).await?;
-        let b = save(&pool, &scope, "b", "b", "note", &[], chunk(), "test", &[]).await?;
-        let c = save(&pool, &scope, "c", "c", "note", &[], chunk(), "test", &[]).await?;
+        let a = save(&pool, &scope, "a", "a", "note", &[], chunk(), "test", &[], &[]).await?;
+        let b = save(&pool, &scope, "b", "b", "note", &[], chunk(), "test", &[], &[]).await?;
+        let c = save(&pool, &scope, "c", "c", "note", &[], chunk(), "test", &[], &[]).await?;
         // Already superseded, so a later merge must leave it alone rather than
         // rewrite whose replacement it was.
         let replaced_c = save(
@@ -954,11 +1279,12 @@ mod tests {
             chunk(),
             "test",
             &[c.id],
+            &[],
         )
         .await?;
         assert_eq!(replaced_c.retired, vec![c.id]);
         // In another project entirely: unreachable from this namespace's writes.
-        let foreign = save(&pool, &other, "f", "f", "note", &[], chunk(), "test", &[]).await?;
+        let foreign = save(&pool, &other, "f", "f", "note", &[], chunk(), "test", &[], &[]).await?;
 
         let merged = save(
             &pool,
@@ -970,6 +1296,7 @@ mod tests {
             chunk(),
             "test",
             &[a.id, b.id, c.id, foreign.id],
+            &[],
         )
         .await?;
         assert_eq!(merged.retired, vec![a.id, b.id]);
@@ -988,6 +1315,142 @@ mod tests {
             .bind(&scope.client_id)
             .execute(&pool)
             .await?;
+        Ok(())
+    }
+
+    /// The edge write rules and the database's own scope guard, against a real
+    /// database with `003_edges.sql` applied. Run by hand like the test above.
+    #[tokio::test]
+    #[ignore]
+    async fn edges_follow_the_write_rules() -> Result<()> {
+        let url = std::env::var("CTXDB_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://ctx:ctx@127.0.0.1:5433/ctxdb".to_string());
+        let pool = connect(&url).await?;
+
+        let scope = Scope {
+            client_id: "ctxdb-selftest-edges".to_string(),
+            namespace: "__ctxdb_selftest".to_string(),
+            session_id: "test".to_string(),
+        };
+        let other_ns = Scope {
+            namespace: "__ctxdb_selftest_other".to_string(),
+            ..scope.clone()
+        };
+        let other_client = Scope {
+            client_id: "ctxdb-selftest-edges-other".to_string(),
+            ..scope.clone()
+        };
+        let chunk = || vec![("chunk".to_string(), vec![0.0f32; 1024])];
+        let mk = |s: &Scope, t: &str| {
+            let s = s.clone();
+            let t = t.to_string();
+            let pool = pool.clone();
+            async move { save(&pool, &s, &t, &t, "note", &[], chunk(), "test", &[], &[]).await }
+        };
+
+        let a = mk(&scope, "a").await?.id;
+        let b = mk(&scope, "b").await?.id;
+        let c = mk(&scope, "c").await?.id;
+        let far = mk(&other_ns, "far").await?.id;
+        let far2 = mk(&other_ns, "far2").await?.id;
+        let stranger = mk(&other_client, "stranger").await?.id;
+
+        // A symmetric edge has one stored order, so the reverse is a duplicate.
+        let first = link(&pool, &scope, b, a, Rel::RelatesTo, None).await?;
+        let LinkOutcome::Created { edge_id, src, dst } = first else {
+            panic!("expected a new edge, got {first:?}");
+        };
+        assert_eq!((src, dst), (a.min(b), a.max(b)));
+        assert_eq!(
+            link(&pool, &scope, a, b, Rel::RelatesTo, None).await?,
+            LinkOutcome::Exists { edge_id, src, dst }
+        );
+        // An asymmetric edge keeps its direction, and each direction is its own.
+        assert!(matches!(
+            link(&pool, &scope, b, a, Rel::DependsOn, None).await?,
+            LinkOutcome::Created { src, dst, .. } if (src, dst) == (b, a)
+        ));
+
+        // Across namespaces inside one client: allowed (D2), with one end here.
+        assert!(matches!(
+            link(&pool, &scope, a, far, Rel::Refines, None).await?,
+            LinkOutcome::Created { .. }
+        ));
+        // Neither end here: refused.
+        assert!(matches!(
+            link(&pool, &scope, far, far2, Rel::RelatesTo, None).await?,
+            LinkOutcome::Refused(_)
+        ));
+        // Another client: invisible, so refused as missing.
+        assert!(matches!(
+            link(&pool, &scope, a, stranger, Rel::RelatesTo, None).await?,
+            LinkOutcome::Refused(_)
+        ));
+        // And the database refuses it on its own, whatever the Rust code does.
+        let raw = sqlx::query(
+            "INSERT INTO memory_edge (client_id, src_id, dst_id, rel) VALUES ($1, $2, $3, 'relates_to')",
+        )
+        .bind(&scope.client_id)
+        .bind(a)
+        .bind(stranger)
+        .execute(&pool)
+        .await;
+        assert!(raw.is_err(), "the composite foreign key must refuse a cross-client edge");
+
+        // A forgotten end is refused.
+        forget(&pool, &scope, c, None).await?;
+        assert!(matches!(
+            link(&pool, &scope, a, c, Rel::RelatesTo, None).await?,
+            LinkOutcome::Refused(_)
+        ));
+
+        // A superseded end resolves to its live head.
+        let b2 = save(&pool, &scope, "b2", "b2", "note", &[], chunk(), "test", &[b], &[]).await?.id;
+        assert!(matches!(
+            link(&pool, &scope, a, b, Rel::Contradicts, None).await?,
+            LinkOutcome::Created { src, dst, .. } if (src, dst) == (a.min(b2), a.max(b2))
+        ));
+
+        // A save that links to a row it also retires would link to itself.
+        let a2 = save(
+            &pool,
+            &scope,
+            "a2",
+            "a2",
+            "note",
+            &[],
+            chunk(),
+            "test",
+            &[a],
+            &[LinkRequest {
+                id: a,
+                rel: Rel::Refines,
+                note: None,
+            }],
+        )
+        .await?;
+        assert!(matches!(a2.links[0], LinkOutcome::Refused(_)));
+
+        // The graph shows a's edges on a2 now, then back on a after a detach.
+        let g = load_graph(&pool, &scope.client_id).await?;
+        assert!(g.links(a).is_empty());
+        assert!(g.links(a2.id).iter().any(|l| l.other == b2 && l.rel == Rel::RelatesTo));
+        restore(&pool, &scope, a, true).await?;
+        let g = load_graph(&pool, &scope.client_id).await?;
+        assert!(g.links(a).iter().any(|l| l.other == b2 && l.rel == Rel::RelatesTo));
+
+        // Forgetting an edge takes it out of the graph.
+        assert!(forget_edge(&pool, &scope, edge_id, Some("test")).await?);
+        assert!(!forget_edge(&pool, &scope, edge_id, None).await?);
+        let g = load_graph(&pool, &scope.client_id).await?;
+        assert!(!g.links(a).iter().any(|l| l.edge_id == edge_id));
+
+        for s in [&scope, &other_client] {
+            sqlx::query("DELETE FROM memory WHERE client_id = $1")
+                .bind(&s.client_id)
+                .execute(&pool)
+                .await?;
+        }
         Ok(())
     }
 }

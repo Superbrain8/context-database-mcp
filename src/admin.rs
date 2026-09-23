@@ -235,6 +235,8 @@ pub async fn save(
         chunks,
         embedder.model(),
         &supersedes,
+        // No `--links` on the operator path yet; context_link covers it.
+        &[],
     )
     .await
     .context("save failed")?;

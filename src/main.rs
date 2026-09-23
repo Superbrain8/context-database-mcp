@@ -8,6 +8,7 @@ mod admin;
 mod consolidate;
 mod db;
 mod embed;
+mod graph;
 mod ingest;
 mod reindex;
 
@@ -63,6 +64,44 @@ struct SaveParams {
     /// into one merged memory.
     #[serde(default)]
     supersedes: Option<Supersedes>,
+    /// Edges from this new memory to existing ones: "new <rel> id".
+    #[serde(default)]
+    links: Option<Vec<LinkSpec>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct LinkSpec {
+    /// Existing memory id.
+    id: i64,
+    rel: graph::Rel,
+    /// Why the edge exists.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct LinkParams {
+    /// The subject: "src_id <rel> dst_id".
+    src_id: i64,
+    dst_id: i64,
+    /// relates_to | contradicts (both symmetric), depends_on (src is only true
+    /// while dst is), refines (src adds detail to dst).
+    rel: graph::Rel,
+    /// Why the edge exists.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct RelatedParams {
+    /// Memory id to start from.
+    id: i64,
+    /// Hops to follow, 1-3. Default 1.
+    #[serde(default)]
+    depth: Option<i64>,
+    /// Follow only this relation.
+    #[serde(default)]
+    rel: Option<graph::Rel>,
 }
 
 /// One id or several.
@@ -122,7 +161,11 @@ struct GetParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ForgetParams {
     /// Memory id to forget.
-    id: i64,
+    #[serde(default)]
+    id: Option<i64>,
+    /// Edge id to forget instead of a memory. Give exactly one of id / edge_id.
+    #[serde(default)]
+    edge_id: Option<i64>,
     /// Why it is being forgotten. Kept for audit.
     #[serde(default)]
     reason: Option<String>,
@@ -179,6 +222,16 @@ impl ContextDb {
             .as_ref()
             .map(Supersedes::ids)
             .unwrap_or_default();
+        let links: Vec<db::LinkRequest> = p
+            .links
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| db::LinkRequest {
+                id: l.id,
+                rel: l.rel,
+                note: l.note,
+            })
+            .collect();
 
         match db::save(
             &self.pool,
@@ -190,6 +243,7 @@ impl ContextDb {
             chunks,
             self.embedder.model(),
             &asked,
+            &links,
         )
         .await
         {
@@ -200,40 +254,109 @@ impl ContextDb {
                 } else {
                     String::new()
                 };
-                if asked.is_empty() {
-                    return format!("saved id={id}{split}");
-                }
-
-                // A requested id that was not retired is reported, never
-                // swallowed: it means the id belongs to another project or was
-                // already superseded, and a merge that silently leaves one of
-                // its originals in search looks like it worked.
-                let missed: Vec<String> = asked
-                    .iter()
-                    .filter(|id| !saved.retired.contains(id))
-                    .map(i64::to_string)
-                    .collect();
-                let retired = saved
-                    .retired
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut out = if saved.retired.is_empty() {
-                    format!("saved id={id}{split} (nothing was retired)")
+                let mut out = if asked.is_empty() {
+                    format!("saved id={id}{split}")
                 } else {
-                    format!("saved id={id}{split} (retired id={retired})")
+                    supersede_report(id, &split, &asked, &saved.retired)
                 };
-                if !missed.is_empty() {
+                for (req, outcome) in links.iter().zip(&saved.links) {
                     out.push_str(&format!(
-                        " -- id={} left alone: not in this project, or already superseded",
-                        missed.join(", ")
+                        "\n  link {} {}: {}",
+                        req.rel.as_str(),
+                        req.id,
+                        link_report(outcome, req.rel)
                     ));
                 }
                 out
             }
             Err(e) => format!("ERROR: save failed: {e:#}"),
         }
+    }
+
+    #[tool(
+        description = "Link two existing memories with a typed edge, read as \"src_id <rel> \
+                       dst_id\". Call this WHEN you notice that one memory depends on, refines, \
+                       contradicts or relates to another. When saving a new memory, use the \
+                       `links` argument of context_save instead."
+    )]
+    async fn context_link(&self, Parameters(p): Parameters<LinkParams>) -> String {
+        match db::link(
+            &self.pool,
+            &self.scope,
+            p.src_id,
+            p.dst_id,
+            p.rel,
+            p.note.as_deref(),
+        )
+        .await
+        {
+            Ok(outcome) => link_report(&outcome, p.rel),
+            Err(e) => format!("ERROR: link failed: {e:#}"),
+        }
+    }
+
+    #[tool(
+        description = "List the memories connected to one memory by edges, up to 3 hops, with \
+                       the relation and hop distance. Returns snippets; call context_get for \
+                       full text."
+    )]
+    async fn context_related(&self, Parameters(p): Parameters<RelatedParams>) -> String {
+        let graph = match db::load_graph(&self.pool, &self.scope.client_id).await {
+            Ok(g) => g,
+            Err(e) => return format!("ERROR: loading the graph failed: {e:#}"),
+        };
+        // Clamped here as well as in the graph: the schema is advice to the
+        // caller, not a limit.
+        let depth = p.depth.unwrap_or(1).clamp(1, graph::MAX_DEPTH as i64) as usize;
+
+        let Some(start) = graph.resolve(p.id) else {
+            return format!("no live memory with id={} in this scope", p.id);
+        };
+        let related = graph.related(start, depth, p.rel);
+        if related.hits.is_empty() {
+            return format!("id={start} has no edges to live memories");
+        }
+
+        let ids: Vec<i64> = related.hits.iter().map(|h| h.id).collect();
+        let nodes = match db::nodes(&self.pool, &self.scope.client_id, &ids).await {
+            Ok(n) => n,
+            Err(e) => return format!("ERROR: reading neighbours failed: {e:#}"),
+        };
+
+        let mut out = String::new();
+        if start != p.id {
+            out.push_str(&format!("id={} was superseded; showing its live head id={start}\n", p.id));
+        }
+        for h in &related.hits {
+            // A row can go hidden between the two queries; skip it rather than
+            // print an id the caller cannot open.
+            let Some(n) = nodes.get(&h.id) else {
+                continue;
+            };
+            let origin = if n.namespace == self.scope.namespace {
+                String::new()
+            } else {
+                format!(" | from project {}", n.namespace)
+            };
+            out.push_str(&format!(
+                "[id={}] ({}) {} | hop {} | {}{}{}\n  {}\n",
+                n.id,
+                n.kind,
+                n.title,
+                h.hop,
+                edge_label(&h.link, h.via),
+                note_label(&h.link),
+                origin,
+                n.snippet.replace('\n', " "),
+            ));
+        }
+        if related.truncated {
+            out.push_str(&format!(
+                "(cut at {} results; lower depth or filter by rel to see the rest)\n",
+                graph::MAX_RESULTS
+            ));
+        }
+        out
     }
 
     #[tool(
@@ -323,7 +446,7 @@ impl ContextDb {
                 } else {
                     format!("  from project {}", m.namespace)
                 };
-                format!(
+                let mut out = format!(
                     "id={} ({}) {}{}\ntags={:?}  created={}{}\n\n{}",
                     m.id,
                     m.kind,
@@ -333,7 +456,22 @@ impl ContextDb {
                     m.created_at.to_rfc3339(),
                     origin,
                     m.body
-                )
+                );
+                // Direct edges only; context_related walks further. A failure
+                // here costs the edge list, never the memory the caller asked for.
+                match db::load_graph(&self.pool, &self.scope.client_id).await {
+                    Ok(g) => {
+                        let links = g.links(m.id);
+                        if !links.is_empty() {
+                            out.push_str("\n\nedges:");
+                            for l in links {
+                                out.push_str(&format!("\n  {}{}", edge_label(l, m.id), note_label(l)));
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("get: loading edges failed: {e:#}"),
+                }
+                out
             }
             Ok(None) => format!("no memory with id={} in this scope", p.id),
             Err(e) => format!("ERROR: get failed: {e:#}"),
@@ -343,14 +481,93 @@ impl ContextDb {
     #[tool(
         description = "Forget a memory that is wrong or obsolete. Prefer context_save with \
                        `supersedes` when you have a corrected version -- use forget only when \
-                       nothing should replace it. This is a soft delete and is recoverable."
+                       nothing should replace it. This is a soft delete and is recoverable. \
+                       Pass `edge_id` instead of `id` to remove an edge."
     )]
     async fn context_forget(&self, Parameters(p): Parameters<ForgetParams>) -> String {
-        match db::forget(&self.pool, &self.scope, p.id, p.reason.as_deref()).await {
-            Ok(true) => format!("forgot id={}", p.id),
-            Ok(false) => format!("no live memory with id={} in this scope", p.id),
-            Err(e) => format!("ERROR: forget failed: {e:#}"),
+        // Two named arguments rather than one id plus a mode flag: a memory id
+        // and an edge id are both small integers, and a flag the caller forgets
+        // would forget the wrong thing.
+        match (p.id, p.edge_id) {
+            (Some(id), None) => {
+                match db::forget(&self.pool, &self.scope, id, p.reason.as_deref()).await {
+                    Ok(true) => format!("forgot id={id}"),
+                    Ok(false) => format!("no live memory with id={id} in this scope"),
+                    Err(e) => format!("ERROR: forget failed: {e:#}"),
+                }
+            }
+            (None, Some(edge)) => {
+                match db::forget_edge(&self.pool, &self.scope, edge, p.reason.as_deref()).await {
+                    Ok(true) => format!("forgot edge={edge}"),
+                    Ok(false) => format!("no live edge with id={edge} in this scope"),
+                    Err(e) => format!("ERROR: forget failed: {e:#}"),
+                }
+            }
+            _ => "ERROR: give exactly one of `id` or `edge_id`".to_string(),
         }
+    }
+}
+
+/// The supersede half of a save's reply.
+///
+/// A requested id that was not retired is reported, never swallowed: it means
+/// the id belongs to another project or was already superseded, and a merge
+/// that silently leaves one of its originals in search looks like it worked.
+fn supersede_report(id: i64, split: &str, asked: &[i64], retired: &[i64]) -> String {
+    let missed: Vec<String> = asked
+        .iter()
+        .filter(|id| !retired.contains(id))
+        .map(i64::to_string)
+        .collect();
+    let retired_list = retired
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = if retired.is_empty() {
+        format!("saved id={id}{split} (nothing was retired)")
+    } else {
+        format!("saved id={id}{split} (retired id={retired_list})")
+    };
+    if !missed.is_empty() {
+        out.push_str(&format!(
+            " -- id={} left alone: not in this project, or already superseded",
+            missed.join(", ")
+        ));
+    }
+    out
+}
+
+/// Reports the stored ids, which can differ from the requested ones: an end may
+/// have resolved to its live head, and a symmetric edge is stored smaller id
+/// first.
+fn link_report(outcome: &db::LinkOutcome, rel: graph::Rel) -> String {
+    let rel = rel.as_str();
+    match outcome {
+        db::LinkOutcome::Created { edge_id, src, dst } => {
+            format!("linked edge={edge_id}: {src} {rel} {dst}")
+        }
+        db::LinkOutcome::Exists { edge_id, src, dst } => {
+            format!("already linked edge={edge_id}: {src} {rel} {dst}")
+        }
+        db::LinkOutcome::Refused(why) => format!("refused: {why}"),
+    }
+}
+
+/// "edge=12: 259 depends_on 258", plus where it was written if an end has been
+/// superseded since.
+fn edge_label(link: &graph::Link, node: i64) -> String {
+    let mut s = format!("edge={}: {}", link.edge_id, link.sentence(node));
+    if let Some((src, dst)) = link.moved_from(node) {
+        s.push_str(&format!(" (written as {src} -> {dst})"));
+    }
+    s
+}
+
+fn note_label(link: &graph::Link) -> String {
+    match &link.note {
+        Some(n) => format!(" -- {}", n.replace('\n', " ")),
+        None => String::new(),
     }
 }
 
@@ -386,7 +603,9 @@ impl rmcp::ServerHandler for ContextDb {
              Do not save what is trivially re-derivable by reading the code.\n\n\
              Memories are append-only. To correct one, save a new memory with `supersedes` \
              set to the old id rather than trying to edit it, or to several ids to replace a \
-             group of overlapping memories with one merged memory."
+             group of overlapping memories with one merged memory.\n\n\
+             When a memory depends on, refines, contradicts or relates to another, link \
+             them (`links` on save, or context_link); context_related follows the links."
                 .to_string(),
         );
         info

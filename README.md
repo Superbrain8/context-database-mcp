@@ -108,14 +108,55 @@ originals in search would look like it worked.
 
 The only in-place update the system performs is the access-stats bump in `context_get`.
 
+### Memories are linked by typed edges
+
+A search finds a memory by its text. An edge connects two memories by their meaning, so an agent can
+follow a relation from a decision to the facts and dead ends behind it.
+
+Each edge reads as the sentence "src *rel* dst":
+
+| `rel` | Symmetric | Sentence |
+|---|---|---|
+| `relates_to` | yes | src is related to dst. |
+| `depends_on` | no | src is only true while dst is true. |
+| `contradicts` | yes | src and dst disagree. Neither one replaces the other. |
+| `refines` | no | src adds detail to dst. It does not replace dst. |
+
+One Rust enum (`graph::Rel`) holds the allowed values. The database has no `CHECK` on `rel`, so a
+new type needs no migration.
+
+Edges obey the same rules as memories:
+
+- **Append + forget.** No tool changes an edge. `context_forget` with `edge_id` sets
+  `forgotten_at` on it.
+- **Supersede moves edges without a rewrite.** An edge keeps the ids that the caller gave. At read
+  time, each end follows `superseded_by` to the live head of its chain. A merge thus shows all the
+  edges of its originals on the merged memory, with duplicates and self-edges removed.
+  `--restore --detach` moves them back. If a chain ends in a forgotten or expired memory, the
+  server hides the edge.
+- **Isolation.** An edge can connect two projects of one client, but never two clients. Composite
+  foreign keys on `(id, client_id)` make the database refuse a cross-client edge. At least one end
+  must be in the project of the calling process.
+- **Write rules.** The server resolves a superseded end to its live head. It refuses a forgotten or
+  expired end, and an edge from a memory to itself. It stores a symmetric edge with the smaller id
+  first, so `relates_to A-B` and `relates_to B-A` are one edge. The reply names each
+  refused edge and the reason.
+
+`context_related` walks the graph breadth-first, three hops at most, and returns 25 memories at
+most. It tells the caller when this limit cuts the result. The walk runs in Rust, not in SQL: the
+server loads the live edges and the supersede map of the client and resolves each end at each hop.
+A forgotten memory thus never becomes a path to its neighbors.
+
 ## Tools
 
 | Tool | Purpose |
 |---|---|
 | `context_save` | Store a durable fact, decision, root cause or file summary. Returns an id. |
 | `context_search` | Hybrid search. Returns ranked **snippets** (300 chars) + ids. `cross_project: true` widens beyond the current project. |
-| `context_get` | Full body of one memory, by id. |
-| `context_forget` | Soft-delete a memory. |
+| `context_get` | Full body of one memory, by id, and its direct edges. |
+| `context_forget` | Soft-delete a memory (`id`), or an edge (`edge_id`). |
+| `context_link` | Make one typed edge between two existing memories. `context_save` can also make edges with `links`. |
+| `context_related` | Memories connected to one memory, up to 3 hops, with the relation and the hop count. Returns snippets. |
 
 `context_search` deliberately returns snippets only. Returning full bodies would re-inflate the
 context window and defeat the point of offloading.
@@ -150,10 +191,12 @@ to change schema is not an option for a store whose entire job is to not forget 
 
 ```bash
 docker exec -i ctxdb-postgres psql -U ctx -d ctxdb -v ON_ERROR_STOP=1 < migrations/002_chunks.sql
+docker exec -i ctxdb-postgres psql -U ctx -d ctxdb -v ON_ERROR_STOP=1 < migrations/003_edges.sql
 ```
 
 `002_chunks.sql` carries existing rows forward as single chunks, so applying it to a populated
-database loses nothing.
+database loses nothing. `003_edges.sql` only adds a table, indexes and one constraint. You can run it
+two times without an error.
 
 ### 2. Build the server
 
@@ -435,6 +478,11 @@ both rankers. Chunking was verified against a 4,000-character document with one 
 buried mid-way through: a paraphrased query sharing no keywords with that sentence retrieved it, and
 returned the containing chunk as the snippet.
 
+The memory graph has unit tests for the walk: loops, the depth cap, the result cap, the rel filter,
+no path through a hidden memory, supersede resolution, a detach, and the removal of duplicate edges
+after a merge. A database test, run by hand, checks the write rules and the composite foreign keys.
+All six tools were also used in a real stdio session against the live stack.
+
 ## Not done yet
 
 - Nothing ages out on its own. `--stale` and `--consolidate` surface the candidates and a save or a
@@ -445,6 +493,11 @@ returned the containing chunk as the snippet.
   the first thing that needs rethinking at tens of thousands of chunks.
 - Chunk boundaries are fixed at save time; `--reindex` carries a chunker fix backwards, but it has to
   be run by hand and re-embeds the whole corpus rather than only the rows that changed.
+- Nothing cleans up edges. The read path hides an edge whose end is gone and removes duplicates
+  after a merge, so the graph is correct without a clean-up. The dead rows stay in `memory_edge`.
+- Search does not follow edges yet. A planned `expand` flag on `context_search` adds the one-hop
+  neighbors of the top results. `--consolidate` could also propose `relates_to` edges from its
+  clusters.
 - Token counts come from the server, so chunking needs the embedder reachable — which it always is on
   a write path. An embedding server with no `/tokenize` route falls back to the old character-based
   chunker and says so in the log.

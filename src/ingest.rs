@@ -161,6 +161,7 @@ async fn store(
         // summary is a record of a different session, not a worse version of
         // this one.
         &[],
+        &[],
     )
     .await?
     .id;
