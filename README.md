@@ -161,6 +161,10 @@ A forgotten memory thus never becomes a path to its neighbors.
 `context_search` deliberately returns snippets only. Returning full bodies would re-inflate the
 context window and defeat the point of offloading.
 
+The operator flags (`--consolidate`, `--edges`, `--stale` and the others) are not tools. A tool
+schema costs tokens in every session. The server instructions name three of the flags with the sign
+that calls for each one. An agent that sees the sign can then tell the user to run the flag.
+
 ## Setup
 
 ### 1. Start the stack

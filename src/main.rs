@@ -606,7 +606,12 @@ impl rmcp::ServerHandler for ContextDb {
              set to the old id rather than trying to edit it, or to several ids to replace a \
              group of overlapping memories with one merged memory.\n\n\
              When a memory depends on, refines, contradicts or relates to another, link \
-             them (`links` on save, or context_link); context_related follows the links."
+             them (`links` on save, or context_link); context_related follows the links.\n\n\
+             Housekeeping is run by the user, as report-only flags on the \
+             context-database-mcp binary. Suggest one when you see its sign, at most once \
+             per session: several near-identical results -> `--consolidate`; related \
+             memories with no edges between them -> `--edges`; results full of outdated \
+             memories -> `--stale`."
                 .to_string(),
         );
         info
