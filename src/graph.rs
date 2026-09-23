@@ -139,6 +139,19 @@ pub struct Hop {
     pub link: Link,
 }
 
+/// Why `Graph::build` left a stored edge out of the graph. `--edges` reports
+/// these for a person to forget; the read path already hides them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dropped {
+    /// An end resolves to a forgotten or expired memory. Restoring that memory
+    /// brings the edge back.
+    Hidden,
+    /// Both ends resolve to one memory, after a merge.
+    SelfEdge { head: i64 },
+    /// Another, older edge says the same thing after resolution.
+    Duplicate { of: i64 },
+}
+
 #[derive(Debug, Default)]
 pub struct Related {
     pub hits: Vec<Hop>,
@@ -154,6 +167,7 @@ pub struct Graph {
     /// here; whether it is the head of its chain is `superseded_by`'s business.
     visible: HashSet<i64>,
     adj: HashMap<i64, Vec<Link>>,
+    dropped: Vec<(Edge, Dropped)>,
 }
 
 impl Graph {
@@ -168,21 +182,24 @@ impl Graph {
             superseded_by,
             visible,
             adj: HashMap::new(),
+            dropped: Vec::new(),
         };
 
         // Oldest edge wins a duplicate, so the id a caller sees is stable from
         // one call to the next.
         edges.sort_by_key(|e| e.id);
-        let mut seen: HashSet<(i64, i64, Rel)> = HashSet::new();
+        let mut seen: HashMap<(i64, i64, Rel), i64> = HashMap::new();
 
         for e in edges {
             // An end that resolves to nothing live hides the edge entirely, so a
             // walk never passes through a forgotten or expired memory.
             let (Some(s), Some(d)) = (g.resolve(e.src), g.resolve(e.dst)) else {
+                g.dropped.push((e, Dropped::Hidden));
                 continue;
             };
             // A merge can put both ends on the same memory.
             if s == d {
+                g.dropped.push((e, Dropped::SelfEdge { head: s }));
                 continue;
             }
             // A merge can also turn two edges into one.
@@ -190,9 +207,11 @@ impl Graph {
                 true => (s.min(d), s.max(d), e.rel),
                 false => (s, d, e.rel),
             };
-            if !seen.insert(key) {
+            if let Some(&of) = seen.get(&key) {
+                g.dropped.push((e, Dropped::Duplicate { of }));
                 continue;
             }
+            seen.insert(key, e.id);
 
             let link = |other, outgoing| Link {
                 edge_id: e.id,
@@ -220,6 +239,22 @@ impl Graph {
             }
         }
         None
+    }
+
+    /// Stored edges the graph leaves out, oldest first, with the reason.
+    pub fn dropped(&self) -> &[(Edge, Dropped)] {
+        &self.dropped
+    }
+
+    /// True when any edge, of any type or direction, joins the live heads of
+    /// `a` and `b`.
+    pub fn linked(&self, a: i64, b: i64) -> bool {
+        let (Some(a), Some(b)) = (self.resolve(a), self.resolve(b)) else {
+            return false;
+        };
+        self.adj
+            .get(&a)
+            .is_some_and(|links| links.iter().any(|l| l.other == b))
     }
 
     /// Direct edges of a live memory. Empty for a superseded or hidden one: its
@@ -418,6 +453,35 @@ mod tests {
         assert_eq!(links[0].other, 3);
         // The oldest edge is the one kept.
         assert_eq!(links[0].edge_id, 10);
+
+        // Every edge the graph left out is accounted for, with its reason.
+        let dropped: Vec<(i64, Dropped)> =
+            g.dropped().iter().map(|(e, why)| (e.id, why.clone())).collect();
+        assert_eq!(
+            dropped,
+            vec![
+                (11, Dropped::Duplicate { of: 10 }),
+                (12, Dropped::SelfEdge { head: 9 }),
+                (13, Dropped::Duplicate { of: 10 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edge_to_a_hidden_memory_is_reported_as_hidden() {
+        let g = graph(vec![edge(1, 1, 2, Rel::RelatesTo)], &[], &[1]);
+        assert_eq!(g.dropped().len(), 1);
+        assert_eq!(g.dropped()[0].1, Dropped::Hidden);
+    }
+
+    #[test]
+    fn linked_sees_any_edge_between_two_heads() {
+        // Edge written against 2, which 5 superseded; either direction counts.
+        let g = graph(vec![edge(1, 1, 2, Rel::DependsOn)], &[(2, 5)], &[1, 2, 5]);
+        assert!(g.linked(1, 5));
+        assert!(g.linked(5, 1));
+        assert!(g.linked(1, 2), "a superseded id resolves before the check");
+        assert!(!g.linked(1, 1));
     }
 
     #[test]

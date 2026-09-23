@@ -7,6 +7,7 @@
 mod admin;
 mod consolidate;
 mod db;
+mod edges;
 mod embed;
 mod graph;
 mod ingest;
@@ -910,6 +911,18 @@ async fn main() -> anyhow::Result<()> {
             &scope,
             threshold_after(&args, "--threshold", consolidate::DEFAULT_THRESHOLD),
             limit_after(&args, "--consolidate", 10),
+        )
+        .await;
+    }
+    // `--edges [N] [--threshold D]`: suggested `relates_to` edges between
+    // memories that share a topic, plus stored edges the graph now hides. A
+    // report like `--consolidate`; every line ends in the tool call to make.
+    if args.iter().any(|a| a == "--edges") {
+        return edges::run(
+            &database_url,
+            &scope,
+            threshold_after(&args, "--threshold", edges::DEFAULT_THRESHOLD),
+            limit_after(&args, "--edges", 20),
         )
         .await;
     }

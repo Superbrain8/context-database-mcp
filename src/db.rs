@@ -451,6 +451,31 @@ pub async fn load_graph(pool: &PgPool, client_id: &str) -> Result<Graph> {
     Ok(Graph::build(edges, superseded_by, visible))
 }
 
+/// Live edges with at least one end in this process's namespace: the edges
+/// this process may forget, so the only ones `--edges` offers to clean up.
+pub async fn edge_ids_in_namespace(
+    pool: &PgPool,
+    scope: &Scope,
+) -> Result<std::collections::HashSet<i64>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT e.id FROM memory_edge e
+        WHERE e.client_id = $1 AND e.forgotten_at IS NULL
+          AND EXISTS (
+              SELECT 1 FROM memory m
+              WHERE m.id IN (e.src_id, e.dst_id) AND m.namespace = $2
+          )
+        "#,
+    )
+    .bind(&scope.client_id)
+    .bind(&scope.namespace)
+    .fetch_all(pool)
+    .await
+    .context("listing this project's edges")?;
+
+    Ok(rows.into_iter().map(|r| r.get("id")).collect())
+}
+
 /// Enough of a memory to list it as a graph neighbour.
 #[derive(Debug)]
 pub struct Node {

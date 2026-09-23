@@ -441,6 +441,39 @@ groups 3 memories, 0.26 groups 7, 0.28 groups 10, 0.35 groups 13 into one cluste
 any cluster of six or more is printed with a warning. A missed cluster costs nothing; a bad merge
 destroys the distinction between a rule and its exception, which look identical to a distance metric.
 
+### 9. Maintenance: `--edges`
+
+```bash
+context-database-mcp --edges [N] [--threshold D]
+```
+
+This command writes nothing. It prints two reports for the current project:
+
+1. **Suggested edges.** These are pairs of live memories whose closest chunks are between 0.22 and
+   the cutoff (default 0.30). A pair below 0.22 is a merge candidate for `--consolidate`, not a
+   link. The report leaves out pairs that have an edge already, and session summaries, because a
+   summary is near every topic of its session. The list starts with the closest pair and shows `N`
+   pairs (default 20). Each pair ends in the `context_link` call to make.
+2. **Stored edges that the graph does not show.** These are edges to a forgotten or expired
+   memory, edges from a memory to itself after a merge, and duplicates after a merge. Each line
+   tells if the edge can come back, and ends in the `context_forget edge_id=…` call.
+
+A distance measures closeness, not direction. Thus the report can only propose `relates_to`. Read
+both memories, then use `depends_on`, `refines` or `contradicts` if that is the true relation.
+
+These numbers come from the live corpus on 2026-09-23. The number of suggestions grows fast with
+the cutoff:
+
+| Project | Memories | 0.26 | 0.28 | 0.30 | 0.33 |
+|---|---|---|---|---|---|
+| `Load_optimized_slicing` | 82 | 40 | 66 | 101 | 178 |
+| `filament db` | 42 | 10 | 16 | 29 | 64 |
+| `Context_Database_MCP` | 21 | 1 | 3 | 6 | 9 |
+
+Each pair up to 0.36 in a manual check had a real shared topic. The cutoff thus controls how
+many pairs you must read, not the precision. Run `--edges` after a merge with `--consolidate`,
+because a merge makes the duplicate edges and the self-edges.
+
 ## Operational notes
 
 - **stdout is the MCP transport.** All logging goes to stderr. A stray `println!` corrupts the
@@ -493,11 +526,11 @@ All six tools were also used in a real stdio session against the live stack.
   the first thing that needs rethinking at tens of thousands of chunks.
 - Chunk boundaries are fixed at save time; `--reindex` carries a chunker fix backwards, but it has to
   be run by hand and re-embeds the whole corpus rather than only the rows that changed.
-- Nothing cleans up edges. The read path hides an edge whose end is gone and removes duplicates
-  after a merge, so the graph is correct without a clean-up. The dead rows stay in `memory_edge`.
+- Nothing removes edges automatically. `--edges` lists the stored edges that the graph does not
+  show, and a person or the model forgets them. The read path hides these edges, so the graph is
+  correct without a clean-up.
 - Search does not follow edges yet. A planned `expand` flag on `context_search` adds the one-hop
-  neighbors of the top results. `--consolidate` could also propose `relates_to` edges from its
-  clusters.
+  neighbors of the top results.
 - Token counts come from the server, so chunking needs the embedder reachable — which it always is on
   a write path. An embedding server with no `/tokenize` route falls back to the old character-based
   chunker and says so in the log.
