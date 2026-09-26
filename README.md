@@ -528,8 +528,17 @@ Git ignores `eval/sets/`, because a set holds memory ids and titles from real pr
 - **Embedding dimension is hardcoded in two places** that must agree: `VECTOR(1024)` in the
   migration and `EMBED_DIM` in `src/embed.rs`. Changing the model means re-embedding every row;
   `embed_model` is stored per row so a migration can find the stale ones.
-- The server pings Postgres and the embedder at startup and exits loudly if either is down, rather
-  than failing on the first tool call where the model would just give up on the tool.
+- The server starts even when Postgres or the embedder is not up yet. A client starts the server
+  one time per session and does not start it again. If the server stops, the session has no memory
+  tools until it ends. Docker Desktop starts the containers some seconds after login, and the
+  embedder then needs more seconds to load its model. The pool connects on the first query, and a
+  failed embedder check at startup only writes a warning. A tool call that needs a missing service
+  returns an error message.
+- Claude Code 2.1.282 and later sends a `server/discover` probe for protocol 2026-07-28 before
+  `initialize`. The server does not implement that version, so it refuses the probe, and the client
+  then uses `initialize`. rmcp 3.1 to 3.4.1 has a bug here: after a refused probe, it rejects every
+  later request that has no 2026-07-28 `_meta` envelope, and `tools/list` fails. `src/probe.rs`
+  answers the probe before rmcp gets it. Remove it when rmcp is fixed.
 
 ## Status
 

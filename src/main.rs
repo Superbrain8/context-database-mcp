@@ -11,6 +11,7 @@ mod edges;
 mod embed;
 mod graph;
 mod ingest;
+mod probe;
 mod reindex;
 
 use std::sync::Arc;
@@ -1088,10 +1089,17 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     let embedder = Embedder::new(embed_url, embed_model);
 
-    // Fail loudly at startup rather than on the first tool call, where the model
-    // would see the error and probably just give up on the tool.
-    embedder.ping().await?;
-    tracing::info!("postgres and embedder reachable");
+    // A warning, never an exit. The server is spawned once per client and never
+    // respawned, so exiting here cost the whole session its memory tools -- and
+    // "not up yet" is routine: Docker Desktop starts the embedder tens of
+    // seconds after login, and the model then takes seconds more to load. This
+    // is the embedder's half of the lazy-pool decision in db::connect. A tool
+    // that needs the embedder reports the error itself; get, forget, link and
+    // related never touch it.
+    match embedder.ping().await {
+        Ok(()) => tracing::info!("embedder reachable"),
+        Err(e) => tracing::warn!("embedder not reachable yet, continuing: {e:#}"),
+    }
 
     let max_distance = env_or("CTXDB_MAX_DISTANCE", "0.55")
         .parse::<f64>()
@@ -1111,7 +1119,21 @@ async fn main() -> anyhow::Result<()> {
         expand_slots,
     };
 
-    let service = server.serve(stdio()).await?;
+    serve_mcp(server, stdio()).await
+}
+
+/// Run the MCP session on `transport` until the client goes away.
+async fn serve_mcp<T, E, A>(server: ContextDb, transport: T) -> anyhow::Result<()>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // The pre-initialize discover probe is answered in front of rmcp; see
+    // probe.rs for the rmcp bug this works around.
+    use rmcp::ServerHandler;
+    let supported = server.supported_protocol_versions();
+    let transport = probe::DiscoverProbeGuard::new(transport.into_transport(), supported);
+    let service = server.serve(transport).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -1176,6 +1198,68 @@ mod tests {
         // Sorted and deduplicated: a repeated id would otherwise be reported as
         // one retired out of two asked for, which reads as a partial failure.
         assert_eq!(many.ids(), vec![3, 7]);
+    }
+
+    /// The exact opening that Claude Code 2.1.282 sends, captured over stdio:
+    /// a `server/discover` probe for 2026-07-28, then (after our "unsupported
+    /// version" reply) a plain `initialize` for 2025-11-25 and a `tools/list`
+    /// with no `_meta`. Every tool must still be listed.
+    #[tokio::test]
+    async fn a_rejected_discover_probe_still_leaves_tools_listable() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client, server_io) = tokio::io::duplex(1 << 16);
+        let server = ContextDb {
+            // Lazy: nothing here opens a connection, and tools/list needs none.
+            pool: db::connect("postgres://nobody@127.0.0.1:1/none")
+                .await
+                .unwrap(),
+            embedder: Arc::new(Embedder::new("http://127.0.0.1:1".into(), "none".into())),
+            scope: Arc::new(Scope {
+                client_id: "test".into(),
+                namespace: "test".into(),
+                session_id: "test".into(),
+            }),
+            max_distance: 0.55,
+            expand_slots: 0,
+        };
+        let handle = tokio::spawn(serve_mcp(server, server_io));
+
+        let (read, mut write) = tokio::io::split(client);
+        let mut lines = BufReader::new(read).lines();
+        let meta = r#"{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"claude-code","version":"2.1.282"},"io.modelcontextprotocol/clientCapabilities":{}}"#;
+        for msg in [
+            format!(r#"{{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{{"_meta":{meta}}}}}"#),
+            r#"{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"claude-code","version":"2.1.282"}},"jsonrpc":"2.0","id":0}"#.into(),
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.into(),
+            r#"{"method":"tools/list","jsonrpc":"2.0","id":1}"#.into(),
+        ] {
+            write.write_all((msg + "\n").as_bytes()).await.unwrap();
+        }
+
+        let mut replies = Vec::new();
+        while replies.len() < 3 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("server answered in time")
+                .unwrap()
+                .expect("server kept the connection open");
+            replies.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+        }
+
+        // The probe is refused as before: we do not speak 2026-07-28.
+        assert_eq!(replies[0]["id"], "server-discover-probe-1");
+        assert_eq!(replies[0]["error"]["code"], -32022);
+        assert_eq!(replies[1]["result"]["protocolVersion"], "2025-11-25");
+        // The regression: this came back as -32602 "request _meta is missing".
+        let names: Vec<&str> = replies[2]["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools/list failed: {}", replies[2]))
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"context_search"), "{names:?}");
+        handle.abort();
     }
 
     #[test]
